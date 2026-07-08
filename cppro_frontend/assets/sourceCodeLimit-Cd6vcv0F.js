@@ -1,0 +1,1 @@
+const e=256*1024;var t=new TextEncoder;function n(e){return t.encode(e).length}function r(e){return e%1024==0?`${e/1024} KiB`:`${(e/1024).toFixed(1)} KiB`}export{r as n,n as r,e as t};

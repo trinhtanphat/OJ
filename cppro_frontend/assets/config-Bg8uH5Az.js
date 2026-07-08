@@ -1,0 +1,1 @@
+var e=`/api`;const t=(e.trim(),e.trim().replace(/\/+$/,``));export{t};

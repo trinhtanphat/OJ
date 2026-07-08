@@ -1,0 +1,1 @@
+import{or as e}from"./lucide-react-Cxu7l83h.js";import{t}from"./compiler-runtime-B50fxNij.js";var n=t(),r=e();function i(e){let t=(0,n.c)(3),i,o;t[0]===e?(i=t[1],o=t[2]):(i=()=>(e&&(document.title=`CPPro: ${e}`),a),o=[e],t[0]=e,t[1]=i,t[2]=o),(0,r.useEffect)(i,o)}function a(){document.title=`CPPro`}export{i as t};
