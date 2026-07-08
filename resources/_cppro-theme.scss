@@ -99,6 +99,8 @@ body.cppro-public-shell #nav-list ul {
 body.cppro-public-shell #page-container {
   width: min(1180px, calc(100vw - 32px));
   margin: 24px auto 0;
+  background: transparent !important;
+  box-shadow: none !important;
 }
 
 body.cppro-public-shell #content {
@@ -260,6 +262,7 @@ body.cppro-public-shell .red {
 
 body.cppro-public-shell footer {
   margin: 1.5rem 0 2rem;
+  background: transparent !important;
   color: #94a3b8;
 }
 
