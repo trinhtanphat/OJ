@@ -234,7 +234,7 @@
         gtag('config', 'G-HJ344NCQQW');
     </script>
 </head>
-<body{% if perms.judge.test_site %} data-theme="{{ SITE_THEME_NAME }}"{% endif %}>
+<body class="cppro-public-shell"{% if perms.judge.test_site %} data-theme="{{ SITE_THEME_NAME }}"{% endif %}>
 <svg width="0" height="0" style="display: block">
     <defs>
         <clipPath id="rating-clip"><circle cx="8" cy="8" r="7"/></clipPath>
@@ -391,7 +391,7 @@
     <footer>
         <span id="footer-content">
             <br>
-            © 2026 <a href="https://cothilaptrinh.vn">Cô Thi Lập Trình</a>.
+            &copy; 2026 {{ SITE_LONG_NAME }}.
             {% if misc_config.footer %}
                 | {{ misc_config.footer|safe }}
             {% endif %}

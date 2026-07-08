@@ -80,6 +80,7 @@ def misc_config(request):
 def site_name(request):
     return {'SITE_NAME': settings.SITE_NAME,
             'SITE_LONG_NAME': settings.SITE_LONG_NAME,
+            'SITE_BRAND_LOGO_URL': getattr(settings, 'SITE_BRAND_LOGO_URL', ''),
             'SITE_ADMIN_EMAIL': settings.SITE_ADMIN_EMAIL}
 
 
