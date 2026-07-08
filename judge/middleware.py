@@ -11,7 +11,7 @@ from django.contrib import auth
 from django.contrib.auth.models import User
 from django.contrib.sites.shortcuts import get_current_site
 from django.core.cache import cache
-from django.http import FileResponse, HttpResponse, HttpResponseRedirect
+from django.http import FileResponse, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.urls import Resolver404, resolve, reverse
 from django.utils.encoding import force_bytes
@@ -57,11 +57,47 @@ class CpproFrontendMiddleware:
         self.index_path = os.path.join(self.frontend_root, 'index.html')
 
     def __call__(self, request):
+        api_response = self.serve_api_fallback(request)
+        if api_response is not None:
+            return api_response
         if self.should_serve_frontend(request):
             response = self.serve_frontend(request)
             if response is not None:
                 return response
         return self.get_response(request)
+
+    def serve_api_fallback(self, request):
+        path = request.path_info or '/'
+        normalized = '/' + path.strip('/')
+        if not (normalized == '/api' or normalized.startswith('/api/')):
+            return None
+        if normalized == '/api/v2' or normalized.startswith('/api/v2/'):
+            return None
+
+        if request.method == 'POST' and normalized in ('/api/stats/visit',):
+            return JsonResponse({})
+        if request.method not in ('GET', 'HEAD'):
+            return None
+
+        if normalized in ('/api/users/online', '/api/stats/users/online'):
+            return JsonResponse({'rows': [], 'total': 0, 'online': 0})
+        if normalized in ('/api/site-settings', '/api/home/summary', '/api/stats'):
+            return JsonResponse({})
+        if normalized in ('/api/languages',):
+            return JsonResponse([], safe=False)
+        row_prefixes = (
+            '/api/problems',
+            '/api/contests',
+            '/api/organizations',
+            '/api/users',
+            '/api/leaderboard',
+            '/api/submissions',
+            '/api/posts',
+            '/api/notifications/announcements',
+        )
+        if any(normalized == prefix or normalized.startswith(prefix + '/') for prefix in row_prefixes):
+            return JsonResponse({'rows': [], 'total': 0})
+        return None
 
     def should_serve_frontend(self, request):
         if request.method not in ('GET', 'HEAD'):
