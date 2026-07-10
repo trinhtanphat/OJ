@@ -437,7 +437,6 @@ INSTALLED_APPS += (
 )
 
 MIDDLEWARE = (
-    'judge.middleware.CpproFrontendMiddleware',
     'judge.middleware.ShortCircuitMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -720,7 +719,6 @@ SESSION_ENGINE = 'django.contrib.sessions.backends.cached_db'
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 DMOJ_RESOURCES = os.path.join(BASE_DIR, 'resources')
-CPPRO_FRONTEND_DIR = os.path.join(BASE_DIR, 'cppro_frontend')
 STATICFILES_FINDERS = (
     'django.contrib.staticfiles.finders.FileSystemFinder',
     'django.contrib.staticfiles.finders.AppDirectoriesFinder',

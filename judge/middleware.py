@@ -1,7 +1,5 @@
 import base64
 import hmac
-import mimetypes
-import os
 import re
 import struct
 from urllib.parse import quote
@@ -11,7 +9,7 @@ from django.contrib import auth
 from django.contrib.auth.models import User
 from django.contrib.sites.shortcuts import get_current_site
 from django.core.cache import cache
-from django.http import FileResponse, HttpResponse, HttpResponseRedirect, JsonResponse
+from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.urls import Resolver404, resolve, reverse
 from django.utils.encoding import force_bytes
@@ -24,116 +22,6 @@ try:
     import uwsgi
 except ImportError:
     uwsgi = None
-
-
-class CpproFrontendMiddleware:
-    reserved_prefixes = (
-        '/admin',
-        '/api',
-        '/accounts',
-        '/channels',
-        '/contestdatacache',
-        '/event',
-        '/i18n',
-        '/impersonate',
-        '/judge-select2',
-        '/martor',
-        '/media',
-        '/newsletter',
-        '/old_oj_media',
-        '/pdf',
-        '/static',
-        '/submission_file',
-        '/tasks',
-        '/userdatacache',
-        '/widgets',
-    )
-
-    def __init__(self, get_response):
-        self.get_response = get_response
-        self.frontend_root = os.path.abspath(
-            getattr(settings, 'CPPRO_FRONTEND_DIR', os.path.join(settings.BASE_DIR, 'cppro_frontend'))
-        )
-        self.index_path = os.path.join(self.frontend_root, 'index.html')
-
-    def __call__(self, request):
-        api_response = self.serve_api_fallback(request)
-        if api_response is not None:
-            return api_response
-        if self.should_serve_frontend(request):
-            response = self.serve_frontend(request)
-            if response is not None:
-                return response
-        return self.get_response(request)
-
-    def serve_api_fallback(self, request):
-        path = request.path_info or '/'
-        normalized = '/' + path.strip('/')
-        if not (normalized == '/api' or normalized.startswith('/api/')):
-            return None
-        if normalized == '/api/v2' or normalized.startswith('/api/v2/'):
-            return None
-
-        if request.method == 'POST' and normalized in ('/api/stats/visit',):
-            return JsonResponse({})
-        if request.method not in ('GET', 'HEAD'):
-            return None
-
-        if normalized in ('/api/users/online', '/api/stats/users/online'):
-            return JsonResponse({'rows': [], 'total': 0, 'online': 0})
-        if normalized in ('/api/site-settings', '/api/home/summary', '/api/stats'):
-            return JsonResponse({})
-        if normalized in ('/api/languages',):
-            return JsonResponse([], safe=False)
-        row_prefixes = (
-            '/api/problems',
-            '/api/contests',
-            '/api/organizations',
-            '/api/users',
-            '/api/leaderboard',
-            '/api/submissions',
-            '/api/posts',
-            '/api/notifications/announcements',
-        )
-        if any(normalized == prefix or normalized.startswith(prefix + '/') for prefix in row_prefixes):
-            return JsonResponse({'rows': [], 'total': 0})
-        return None
-
-    def should_serve_frontend(self, request):
-        if request.method not in ('GET', 'HEAD'):
-            return False
-        if not os.path.isfile(self.index_path):
-            return False
-
-        path = request.path_info or '/'
-        normalized = '/' + path.strip('/')
-        for prefix in self.reserved_prefixes:
-            if normalized == prefix or normalized.startswith(prefix + '/'):
-                return False
-        return True
-
-    def serve_frontend(self, request):
-        relative_path = (request.path_info or '/').lstrip('/')
-        if relative_path:
-            candidate_path = os.path.abspath(os.path.join(self.frontend_root, relative_path))
-            if self.is_frontend_file(candidate_path):
-                return self.file_response(candidate_path)
-        return self.file_response(self.index_path, content_type='text/html; charset=utf-8')
-
-    def is_frontend_file(self, path):
-        try:
-            return os.path.commonpath([self.frontend_root, path]) == self.frontend_root and os.path.isfile(path)
-        except ValueError:
-            return False
-
-    def file_response(self, path, content_type=None):
-        guessed_type = content_type or mimetypes.guess_type(path)[0] or 'application/octet-stream'
-        response = FileResponse(open(path, 'rb'), content_type=guessed_type)
-        if path == self.index_path:
-            response['Cache-Control'] = 'no-cache'
-        else:
-            response['Cache-Control'] = 'public, max-age=31536000, immutable'
-        return response
 
 
 class ShortCircuitMiddleware:

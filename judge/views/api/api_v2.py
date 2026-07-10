@@ -2,7 +2,7 @@ from operator import attrgetter
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
-from django.db.models import Count, F, OuterRef, Prefetch, Q, Subquery
+from django.db.models import F, OuterRef, Prefetch, Q, Subquery
 from django.http import Http404, JsonResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -631,6 +631,13 @@ class APISubmissionList(APIListView):
         )
 
     def get_object_data(self, submission):
+        # A submission can carry a denormalized contest_object without an
+        # associated ContestSubmission row (submission.contest). Guard the
+        # reverse relation so listing non-contest submissions does not 500.
+        try:
+            contest_submission = submission.contest
+        except ObjectDoesNotExist:
+            contest_submission = None
         return {
             'id': submission.id,
             'problem': submission.problem.code,
@@ -641,11 +648,11 @@ class APISubmissionList(APIListView):
             'memory': submission.memory,
             'points': submission.points,
             'result': submission.result,
-            'contest': None if not submission.contest_object else {
+            'contest': None if (not submission.contest_object or contest_submission is None) else {
                 'key': submission.contest_object.key,
-                'points': submission.contest.points,
-                'virtual_participation_number': submission.contest.participation.virtual,
-                'time_since_start_of_participation': submission.date - submission.contest.participation.real_start,
+                'points': contest_submission.points,
+                'virtual_participation_number': contest_submission.participation.virtual,
+                'time_since_start_of_participation': submission.date - contest_submission.participation.real_start,
             },
         }
 
@@ -716,7 +723,10 @@ class APIOrganizationList(APIListView):
     )
 
     def get_unfiltered_queryset(self):
-        return Organization.objects.annotate(member_count=Count('member')).order_by('id')
+        # Organization.member_count is a denormalized IntegerField kept in sync by
+        # Organization.on_user_changes(); annotating over it raises
+        # "The annotation 'member_count' conflicts with a field on the model."
+        return Organization.objects.order_by('id')
 
     def get_object_data(self, organization):
         return {
