@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 import datetime
 import os
+import secrets
 
 from django.utils.translation import gettext_lazy as _
 from django_jinja.builtins import DEFAULT_EXTENSIONS
@@ -21,11 +22,14 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = '5*9f5q57mqmlz2#f$x1h76&jxy#yortjl1v+l*6hd18$d*yx#0'
+# SECURITY WARNING: production must supply a secret through the environment
+# or local_settings.py. Development receives an ephemeral key so source and
+# deployment bundles never carry a shared secret.
+_DEVELOPMENT_SECRET_KEY = secrets.token_urlsafe(50)
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', _DEVELOPMENT_SECRET_KEY)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', '1').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 ALLOWED_HOSTS = []
 
@@ -57,7 +61,7 @@ VNOJ_ORG_PP_SCALE = 1
 
 VNOJ_ENABLE_API = False
 VNOJ_ENABLE_SYNC_API = True  # need to make this true for testing :sad:
-GLOBAL_API_KEY = 'test-api-key-123'
+GLOBAL_API_KEY = os.environ.get('GLOBAL_API_KEY') or None
 
 VNOJ_OFFICIAL_CONTEST_MODE = False
 
@@ -699,8 +703,8 @@ EVENT_DAEMON_GET = 'ws://localhost:9996/'
 EVENT_DAEMON_POLL = '/channels/'
 EVENT_DAEMON_KEY = None
 EVENT_DAEMON_AMQP_EXCHANGE = 'dmoj-events'
-EVENT_DAEMON_SUBMISSION_KEY = '6Sdmkx^%pk@GsifDfXcwX*Y7LRF%RGT8vmFpSxFBT$fwS7trc8raWfN#CSfQuKApx&$B#Gh2L7p%W!Ww'
-EVENT_DAEMON_CONTEST_KEY = '&w7hB-.9WnY2Jj^Qm+|?o6a<!}_2Wiw+?(_Yccqq{uR;:kWQP+3R<r(ICc|4^dDeEuJE{*D;Gg@K(4K>'
+EVENT_DAEMON_SUBMISSION_KEY = os.environ.get('EVENT_DAEMON_SUBMISSION_KEY') or None
+EVENT_DAEMON_CONTEST_KEY = os.environ.get('EVENT_DAEMON_CONTEST_KEY') or None
 
 # Internationalization
 # https://docs.djangoproject.com/en/4.2/topics/i18n/
@@ -795,3 +799,6 @@ try:
         exec(f.read(), globals())
 except IOError:
     pass
+
+if not DEBUG and SECRET_KEY == _DEVELOPMENT_SECRET_KEY:
+    raise RuntimeError('Set DJANGO_SECRET_KEY when DEBUG is disabled.')
