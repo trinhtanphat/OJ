@@ -341,6 +341,13 @@ class Problem(models.Model):
         # Don't need to check for ProblemTestcaseAccess.AUTHOR_ONLY
         return False
 
+    def is_testcase_result_accessible_by(self, user):
+        return (
+            user.is_superuser
+            or self.is_editable_by(user)
+            or self.testcase_result_visibility_mode == ProblemTestcaseResultAccess.ALL_TEST_CASE
+        )
+
     @classmethod
     def get_visible_problems(cls, user):
         # Do unauthenticated check here so we can skip authentication checks later on.

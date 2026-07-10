@@ -6,8 +6,8 @@ from urllib.parse import urljoin
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.files.storage import default_storage
-from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden, \
-    HttpResponseRedirect
+from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden, HttpResponseRedirect, \
+    JsonResponse
 from django.views.decorators.http import require_POST
 
 from judge.models import Submission
@@ -89,6 +89,12 @@ def martor_image_uploader(request):
 
 
 def csrf_failure(request: HttpRequest, reason=''):
+    # The CPPro SPA uses cookie sessions. Returning a redirect here would make
+    # fetch follow it as a GET and could turn a rejected mutation into a false
+    # success in the UI. Keep the legacy browser redirect below unchanged.
+    if request.path.startswith('/api/cppro/'):
+        return JsonResponse({'message': 'CSRF token missing or incorrect.'}, status=403)
+
     # Redirect to the same page in case of CSRF failure
     # So that we can turn on cloudflare DDOS protection without
     # showing the CSRF failure page to user

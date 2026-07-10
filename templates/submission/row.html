@@ -17,7 +17,7 @@
         <span class="language">{{ submission.language.short_display_name }}</span>
     </div>
 </div>
-{% set can_view_testcase_status = request.user.is_superuser or submission.problem.testcase_result_visibility_mode == 'A' %}
+{% set can_view_testcase_status = submission.problem.is_testcase_result_accessible_by(request.user) %}
 <div class="sub-main">
     <div class="sub-info{% if submission.status == 'G' %} sub-info-grading{% endif %}">
         {% if show_problem %}

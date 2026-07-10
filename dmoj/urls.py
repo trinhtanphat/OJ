@@ -14,7 +14,7 @@ from django.views.generic import RedirectView
 
 from judge.feed import AtomBlogFeed, AtomCommentFeed, AtomProblemFeed, BlogFeed, CommentFeed, ProblemFeed
 from judge.sitemap import sitemaps
-from judge.views import TitledTemplateView, api, blog, comment, contests, language, license, mailgun, organization, \
+from judge.views import TitledTemplateView, api, blog, comment, contests, cppro_api, language, license, mailgun, organization, \
     preview, problem, problem_manage, ranked_submission, register, stats, status, submission, tag, tasks, ticket, \
     two_factor, user, widgets
 from judge.views.magazine import MagazinePage
@@ -102,6 +102,47 @@ def paged_list_view(view, name):
 
 
 urlpatterns = [
+    # CPPro shares the authenticated DMOJ session.  Keep these explicit routes
+    # ahead of generic legacy paths so management remains a separate SPA from
+    # Django's /admin/ site.
+    path('api/cppro/auth/me', cppro_api.cppro_auth_me),
+    path('api/cppro/auth/login', cppro_api.cppro_auth_login),
+    path('api/cppro/auth/register', cppro_api.cppro_auth_register),
+    path('api/cppro/auth/logout', cppro_api.cppro_auth_logout),
+    path('api/cppro/data', cppro_api.cppro_data),
+    path('api/cppro/stats/visit', cppro_api.cppro_home_visit),
+    path('api/cppro/admin/platform-settings/smtp/test', cppro_api.cppro_platform_smtp_test),
+    path('api/cppro/admin/platform-settings/smtp', cppro_api.cppro_platform_smtp_settings),
+    path('api/cppro/admin/platform-settings/site', cppro_api.cppro_platform_site_settings),
+    path('api/cppro/admin/platform-settings', cppro_api.cppro_platform_settings),
+    path('api/cppro/admin/management/<str:section>/<str:identifier>', cppro_api.cppro_admin_management),
+    path('api/cppro/admin/management/<str:section>', cppro_api.cppro_admin_management),
+    path('api/cppro/admin/problems/<str:identifier>/<str:action>', cppro_api.cppro_problem_admin),
+    path(
+        'api/cppro/problems/<str:identifier>/testcases',
+        cppro_api.cppro_problem_admin,
+        {'action': 'testcases'},
+    ),
+    path('api/cppro/problems/<str:identifier>', cppro_api.cppro_problems),
+    path('api/cppro/problems', cppro_api.cppro_problems),
+    path('api/cppro/contests/<str:identifier>/standings', cppro_api.cppro_contest_standings),
+    path('api/cppro/contests/<str:identifier>/attendance/join', cppro_api.cppro_contest_join),
+    path('api/cppro/contests/<str:identifier>/attendance/check-in', cppro_api.cppro_contest_join),
+    path('api/cppro/contests/<str:identifier>/attendance/leave', cppro_api.cppro_contest_leave),
+    path('api/cppro/contests/<str:identifier>', cppro_api.cppro_contest_detail),
+    path('api/cppro/contests', cppro_api.cppro_contests),
+    path('api/cppro/submissions/<int:submission_id>', cppro_api.cppro_submission_detail),
+    path('api/cppro/submissions', cppro_api.cppro_create_submission),
+    path('api/cppro/profile/<str:username>', cppro_api.cppro_profile_detail),
+    path('api/cppro/profile', cppro_api.cppro_profile),
+    path('api/cppro/organizations/<str:identifier>/join', cppro_api.cppro_organization_join),
+    path('api/cppro/organizations/<str:identifier>', cppro_api.cppro_organization_detail),
+    path('api/cppro/organizations', cppro_api.cppro_organizations),
+    path('api/cppro/admin/organizations/<str:identifier>', cppro_api.cppro_admin_organizations),
+    path('api/cppro/admin/organizations', cppro_api.cppro_admin_organizations),
+    path('api/cppro/social/posts/<str:post_id>/<str:resource>', cppro_api.cppro_post_social),
+    path('api/cppro/posts/<str:identifier>/comments/<str:comment_id>/<str:action>', cppro_api.cppro_post_comments),
+    path('api/cppro/posts/<str:identifier>/comments', cppro_api.cppro_post_comments),
     path('', blog.PostList.as_view(template_name='home.html', title=_('Home')), kwargs={'page': 1}, name='home'),
     path('500/', exception),
     path('admin/', admin.site.urls),

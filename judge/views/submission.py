@@ -260,8 +260,9 @@ class SubmissionStatus(SubmissionDetailBase):
         else:
             context['cases_data'] = {}
 
-        context['can_view_testcase_status'] = self.request.user.is_superuser or \
-            submission.problem.testcase_result_visibility_mode == ProblemTestcaseResultAccess.ALL_TEST_CASE
+        context['can_view_testcase_status'] = submission.problem.is_testcase_result_accessible_by(
+            self.request.user,
+        )
         context['can_view_batch_status'] = submission.problem.testcase_result_visibility_mode \
             == ProblemTestcaseResultAccess.ONLY_BATCH_RESULT
 
