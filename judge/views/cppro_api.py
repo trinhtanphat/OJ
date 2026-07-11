@@ -2189,22 +2189,26 @@ def cppro_contest_standings(request, identifier):
 
     summaries = {}
     if not frozen or can_edit:
-        precision = max(0, int(getattr(contest, 'points_precision', 0) or 0))
         for participation in participation_rows:
             results = problem_results.get(participation.id, {})
-            score = round(sum(float(item.get('score') or 0) for item in results.values()), precision)
             solved = sum(1 for item in results.values() if item.get('accepted'))
-            penalty = sum(int(item.get('elapsed_seconds') or 0) for item in results.values() if item.get('accepted'))
             summaries[participation.id] = {
-                'score': score,
+                # ContestParticipation is the native, format-aware source of
+                # truth for aggregate standings. Rebuilding the total from the
+                # optional problem detail rows turns a valid stored score into
+                # zero when a contest has no attached detail rows, and also
+                # loses format-specific penalty/tiebreaker semantics.
+                'score': float(participation.score or 0),
                 'solved': solved,
-                'penalty': penalty,
+                'penalty': int(participation.cumtime or 0),
+                'tiebreaker': float(participation.tiebreaker or 0),
                 'submissions': sum(int(item.get('attempts') or 0) for item in results.values()),
             }
         participation_rows.sort(key=lambda item: (
             bool(item.is_disqualified),
             -summaries[item.id]['score'],
             summaries[item.id]['penalty'],
+            summaries[item.id]['tiebreaker'],
             -summaries[item.id]['solved'],
             item.id,
         ))
@@ -2217,7 +2221,7 @@ def cppro_contest_standings(request, identifier):
         if summary is not None:
             score = summary['score']
             cumtime = summary['penalty']
-            tiebreaker = 0.0
+            tiebreaker = summary['tiebreaker']
             solved = summary['solved']
             submission_count = summary['submissions']
         else:

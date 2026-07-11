@@ -27,6 +27,9 @@ class SubmissionTestcaseStatusAccessTestCase(CommonDataMixin, TestCase):
             language=Language.get_python3(),
             status='D',
             result='WA',
+            time=0.01,
+            memory=1024,
+            points=0,
             case_points=0,
             case_total=1,
         )
@@ -345,7 +348,11 @@ class SubmissionTestcaseStatusAccessTestCase(CommonDataMixin, TestCase):
         self.assertEqual(visible_response.status_code, 200)
 
     def test_cppro_data_respects_organization_post_visibility(self):
-        organization = create_organization(name='cppro_post_organization', is_unlisted=False)
+        organization = create_organization(
+            name='cppro_post_organization',
+            short_name='cppro_post_org',
+            is_unlisted=False,
+        )
         organization_post = create_blogpost(
             title='cppro_organization_post',
             visible=True,
@@ -406,6 +413,14 @@ class SubmissionTestcaseStatusAccessTestCase(CommonDataMixin, TestCase):
         self.assertTrue(standings_payload['frozen'])
         self.assertEqual(standings_rows[self.users['normal'].username]['score'], 7)
 
+        platform_staff = create_user(username='cppro_scoreboard_platform_staff', is_staff=True)
+        self.client.force_login(platform_staff)
+        staff_frozen_payload = self.client.get('/api/cppro/contests/%s/standings' % frozen_contest.key).json()
+        staff_frozen_rows = {row['username']: row for row in staff_frozen_payload['rows']}
+        self.assertFalse(staff_frozen_payload['frozen'])
+        self.assertEqual(staff_frozen_rows[self.users['normal'].username]['score'], 97)
+        self.client.logout()
+
         hidden_contest = Contest.objects.create(
             key='cppro_hidden_scoreboard',
             name='Hidden CPPro scoreboard',
@@ -425,7 +440,6 @@ class SubmissionTestcaseStatusAccessTestCase(CommonDataMixin, TestCase):
         self.assertFalse(hidden_payload['participant_users_available'])
         self.assertEqual(hidden_payload['participant_users'], [])
 
-        platform_staff = create_user(username='cppro_scoreboard_platform_staff', is_staff=True)
         self.client.force_login(platform_staff)
         staff_detail_response = self.client.get('/api/cppro/contests/%s' % hidden_contest.key)
         self.assertEqual(staff_detail_response.status_code, 200)
@@ -437,7 +451,11 @@ class SubmissionTestcaseStatusAccessTestCase(CommonDataMixin, TestCase):
         self.assertEqual(staff_standings_response.json()['rows'][0]['score'], 99)
 
     def test_cppro_public_profiles_and_standings_hide_unlisted_organization_affiliations(self):
-        organization = create_organization(name='cppro_unlisted_affiliation', is_unlisted=True)
+        organization = create_organization(
+            name='cppro_unlisted_affiliation',
+            short_name='cppro_unlisted',
+            is_unlisted=True,
+        )
         member = create_user(username='cppro_unlisted_org_member')
         member.profile.organizations.add(organization)
 
