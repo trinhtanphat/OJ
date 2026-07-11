@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+import pyotp
 from django.conf import settings
 from django.test import Client, RequestFactory, TestCase
 from django.urls import reverse
@@ -559,3 +560,138 @@ class CpproCsrfFailureTestCase(TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response['Location'], '/problem/hidden_case_status/edit')
+
+
+class CpproAuthSessionAndAdminAccessTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.member = create_user(username='cppro_auth_member')
+        cls.member.set_password('member-password-123')
+        cls.member.save(update_fields=['password'])
+
+        cls.staff = create_user(username='cppro_auth_staff', is_staff=True)
+        cls.staff.set_password('staff-password-123')
+        cls.staff.save(update_fields=['password'])
+
+        cls.two_factor_secret = 'JBSWY3DPEHPK3PXP'
+        cls.two_factor_staff = create_user(username='cppro_auth_two_factor_staff', is_staff=True)
+        cls.two_factor_staff.set_password('two-factor-password-123')
+        cls.two_factor_staff.save(update_fields=['password'])
+        cls.two_factor_staff.profile.is_totp_enabled = True
+        cls.two_factor_staff.profile.totp_key = cls.two_factor_secret
+        cls.two_factor_staff.profile.save(update_fields=['is_totp_enabled', 'totp_key'])
+
+    def _csrf_token(self, client):
+        bootstrap = client.get('/api/cppro/auth/me')
+        self.assertEqual(bootstrap.status_code, 200)
+        return bootstrap.cookies[settings.CSRF_COOKIE_NAME].value
+
+    def _login(self, client, username, password):
+        csrf_token = self._csrf_token(client)
+        response = client.post(
+            '/api/cppro/auth/login',
+            data={'username': username, 'password': password},
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['user']['username'], username)
+        return csrf_token
+
+    def test_anonymous_and_regular_member_cannot_access_any_admin_surface(self):
+        anonymous = Client(enforce_csrf_checks=True)
+        native_admin = anonymous.get('/admin/')
+        self.assertEqual(native_admin.status_code, 302)
+        self.assertEqual(native_admin['Location'], '/admin/login/?next=/admin/')
+        self.assertEqual(
+            anonymous.get('/api/cppro/admin/management/dashboard').status_code,
+            403,
+        )
+
+        member = Client(enforce_csrf_checks=True)
+        self._login(member, self.member.username, 'member-password-123')
+        session_payload = member.get('/api/cppro/auth/me').json()
+        self.assertTrue(session_payload['authenticated'])
+        self.assertEqual(session_payload['user']['username'], self.member.username)
+
+        native_member_admin = member.get('/admin/')
+        self.assertEqual(native_member_admin.status_code, 302)
+        self.assertEqual(native_member_admin['Location'], '/admin/login/?next=/admin/')
+        self.assertEqual(
+            member.get('/api/cppro/admin/management/dashboard').status_code,
+            403,
+        )
+        logout_csrf_token = self._csrf_token(member)
+        self.assertEqual(
+            member.post(
+                '/api/cppro/auth/logout',
+                data='{}',
+                content_type='application/json',
+                HTTP_X_CSRFTOKEN=logout_csrf_token,
+            ).status_code,
+            200,
+        )
+        self.assertFalse(member.get('/api/cppro/auth/me').json()['authenticated'])
+
+    def test_staff_login_and_logout_keep_django_and_cppro_sessions_in_sync(self):
+        client = Client(enforce_csrf_checks=True)
+        self._login(client, self.staff.username, 'staff-password-123')
+
+        self.assertTrue(client.get('/api/cppro/auth/me').json()['authenticated'])
+        self.assertEqual(client.get('/admin/').status_code, 200)
+        self.assertEqual(client.get('/api/cppro/admin/management/dashboard').status_code, 200)
+
+        logout_csrf_token = self._csrf_token(client)
+        logout = client.post(
+            '/api/cppro/auth/logout',
+            data='{}',
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=logout_csrf_token,
+        )
+        self.assertEqual(logout.status_code, 200)
+        self.assertFalse(client.get('/api/cppro/auth/me').json()['authenticated'])
+
+        logged_out_admin = client.get('/admin/')
+        self.assertEqual(logged_out_admin.status_code, 302)
+        self.assertEqual(logged_out_admin['Location'], '/admin/login/?next=/admin/')
+        self.assertEqual(
+            client.get('/api/cppro/admin/management/dashboard').status_code,
+            403,
+        )
+
+    def test_staff_with_two_factor_cannot_reach_admin_before_a_valid_code(self):
+        client = Client(enforce_csrf_checks=True)
+        csrf_token = self._csrf_token(client)
+        pending = client.post(
+            '/api/cppro/auth/login',
+            data={
+                'username': self.two_factor_staff.username,
+                'password': 'two-factor-password-123',
+            },
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(pending.status_code, 200)
+        self.assertTrue(pending.json()['twoFactorRequired'])
+        self.assertFalse(client.get('/api/cppro/auth/me').json()['authenticated'])
+        self.assertEqual(client.get('/admin/').status_code, 302)
+        self.assertEqual(
+            client.get('/api/cppro/admin/management/dashboard').status_code,
+            403,
+        )
+
+        verified = client.post(
+            '/api/cppro/auth/login',
+            data={
+                'username': self.two_factor_staff.username,
+                'password': 'two-factor-password-123',
+                'twoFactorCode': pyotp.TOTP(self.two_factor_secret).now(),
+            },
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(verified.status_code, 200)
+        self.assertEqual(verified.json()['user']['username'], self.two_factor_staff.username)
+        self.assertTrue(client.get('/api/cppro/auth/me').json()['authenticated'])
+        self.assertEqual(client.get('/admin/').status_code, 200)
+        self.assertEqual(client.get('/api/cppro/admin/management/dashboard').status_code, 200)

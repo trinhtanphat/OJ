@@ -32,6 +32,7 @@ from judge.models.problem import ProblemGroup, ProblemType
 from judge.models.problem_data import CHECKERS, GRADERS, ProblemData, ProblemTestCase
 from judge.models.runtime import RuntimeVersion
 from judge.models.ticket import Ticket
+from judge.forms import TwoFactorLoginForm
 from judge.utils.problem_data import ProblemDataCompiler
 from judge.views.register import CustomRegistrationForm, RegistrationView
 
@@ -1175,8 +1176,30 @@ def cppro_auth_login(request):
     user = authenticate(request, username=username, password=password)
     if user is None or not user.is_active:
         return _json_error('Tên đăng nhập hoặc mật khẩu không đúng.', 401)
-    login(request, user)
     profile, _ = Profile.objects.select_related('user').get_or_create(user=user)
+    two_factor_code = str(payload.get('twoFactorCode', payload.get('two_factor_code')) or '').strip()
+    requires_two_factor = bool(profile.is_totp_enabled or profile.is_webauthn_enabled)
+    if requires_two_factor:
+        if not two_factor_code:
+            return JsonResponse({
+                'twoFactorRequired': True,
+                'message': 'Nhập mã xác thực hai lớp hoặc mã khôi phục để tiếp tục.',
+            }, json_dumps_params={'ensure_ascii': False})
+        two_factor_form = TwoFactorLoginForm(
+            data={'totp_or_scratch_code': two_factor_code},
+            profile=profile,
+            webauthn_challenge=None,
+            webauthn_origin='',
+        )
+        if not two_factor_form.is_valid():
+            return _json_error('Mã xác thực hai lớp không đúng.', 401)
+
+    # Do not inherit a successful second-factor marker from a previous user in
+    # this browser session. Only a validated current account may set it again.
+    request.session.pop('2fa_passed', None)
+    login(request, user)
+    if requires_two_factor:
+        request.session['2fa_passed'] = True
     return JsonResponse({'token': 'lcoj-session', 'user': _auth_user_row(profile)}, json_dumps_params={'ensure_ascii': False})
 
 
