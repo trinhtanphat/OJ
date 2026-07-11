@@ -16,7 +16,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.mail.backends.smtp import EmailBackend
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Max, Q, Sum
+from django.db.models import Count, Max, Prefetch, Q, Sum
 from django.http import JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
@@ -116,11 +116,12 @@ def _home_traffic_snapshot(config=None):
     }
 
 
-def _home_activity_rows():
+def _home_activity_rows(submission_queryset=None):
     today = timezone.localdate()
     first_day = today - timedelta(days=13)
     totals = {str(first_day + timedelta(days=offset)): {'submissions': 0, 'accepted': 0} for offset in range(14)}
-    submissions = Submission.objects.filter(date__date__gte=first_day).values_list('date', 'result', 'status')
+    query = submission_queryset if submission_queryset is not None else Submission.objects.all()
+    submissions = query.filter(date__date__gte=first_day).values_list('date', 'result', 'status')
     for submitted_at, result, status in submissions:
         if not submitted_at:
             continue
@@ -161,6 +162,20 @@ def _post_row(post, post_type='announcement'):
         'vote_score': int(post.score or 0),
         'comment_count': 0,
     }
+
+
+def _visible_registered_posts(kind, request_user, limit=24):
+    """Return only posts whose native BlogPost visibility allows this viewer."""
+    post_ids = _registered_post_ids(kind)
+    if not post_ids:
+        return []
+    posts = (
+        BlogPost.objects
+        .filter(id__in=post_ids, visible=True, publish_on__lte=timezone.now())
+        .prefetch_related('authors__user')
+        .order_by('-sticky', '-publish_on', '-id')
+    )
+    return [post for post in posts if post.can_see(request_user)][:limit]
 
 
 def _contest_announcement_row(announcement):
@@ -325,8 +340,12 @@ class CpproSMTPEmailBackend(EmailBackend):
         super().__init__(*args, **kwargs)
 
 
+def _is_platform_admin(user):
+    return bool(user.is_authenticated and user.is_staff)
+
+
 def _require_platform_admin(request):
-    if request.user.is_authenticated and request.user.is_staff:
+    if _is_platform_admin(request.user):
         return None
     return _json_error('Administrator access required.', 403)
 
@@ -456,7 +475,7 @@ def _contest_problem_row(contest_problem, submission_counts):
     }
 
 
-def _contest_participation_row(participation):
+def _contest_participation_row(participation, frozen=False):
     if not participation:
         return None
     if participation.is_disqualified:
@@ -473,13 +492,15 @@ def _contest_participation_row(participation):
         participation_type = 'virtual'
     else:
         participation_type = 'official'
+    score = participation.frozen_score if frozen else participation.score
+    cumtime = participation.frozen_cumtime if frozen else participation.cumtime
     return {
         'id': participation.id,
         'status': status,
         'virtual': int(participation.virtual or 0),
         'participation_type': participation_type,
-        'score': float(participation.score or 0),
-        'cumtime': int(participation.cumtime or 0),
+        'score': float(score or 0),
+        'cumtime': int(cumtime or 0),
         'is_disqualified': bool(participation.is_disqualified),
         'started_at': participation.real_start.isoformat() if participation.real_start else '',
         'end_time': participation.end_time.isoformat() if participation.end_time else '',
@@ -502,10 +523,10 @@ def _contest_participation_counts(contest_ids):
     return official_counts, virtual_counts
 
 
-def _contest_participant_row(participation):
+def _contest_participant_row(participation, frozen=False):
     profile = participation.user
     return {
-        **(_contest_participation_row(participation) or {}),
+        **(_contest_participation_row(participation, frozen=frozen) or {}),
         'user_id': profile.id,
         'username': profile.user.username,
         'full_name': _author_name(profile),
@@ -514,7 +535,41 @@ def _contest_participant_row(participation):
     }
 
 
-def _contest_row(contest, participation_counts, virtual_participation_counts, submission_counts, profile=None):
+def _contest_scoreboard_access(contest, request_user):
+    can_edit = bool(
+        request_user.is_authenticated
+        and (_is_platform_admin(request_user) or request_user.is_superuser or contest.is_editable_by(request_user))
+    )
+    can_view_full = bool(can_edit or contest.can_see_full_scoreboard(request_user))
+    return can_view_full, can_edit, bool(contest.is_frozen and not can_edit)
+
+
+def _can_view_contest_problems(contest, request_user, profile=None):
+    # Match the native contest page: problem identities stay sealed until the
+    # viewer is actively participating, the contest ends, or the viewer is a
+    # contest/platform manager.
+    if contest.ended:
+        return True
+    if not request_user.is_authenticated:
+        return False
+    if request_user.is_staff or request_user.is_superuser:
+        return True
+    profile = profile or _current_profile_from_user(request_user)
+    if not profile:
+        return False
+    if contest.is_in_contest(request_user):
+        return True
+    return profile.id in contest.editor_ids or profile.id in contest.tester_ids
+
+
+def _contest_row(
+    contest,
+    participation_counts,
+    virtual_participation_counts,
+    submission_counts,
+    profile=None,
+    request_user=None,
+):
     contest_problems = list(
         contest.contest_problems
         .select_related('problem')
@@ -550,6 +605,11 @@ def _contest_row(contest, participation_counts, virtual_participation_counts, su
     format_labels = dict(Contest._meta.get_field('format_name').choices or [])
     freeze_minutes = max(0, int(contest.frozen_last_minutes or 0))
     freeze_time = contest.frozen_time if freeze_minutes and contest.end_time else None
+    frozen_scoreboard = bool(contest.is_frozen)
+    can_view_problems = False
+    if request_user is not None:
+        _, _, frozen_scoreboard = _contest_scoreboard_access(contest, request_user)
+        can_view_problems = _can_view_contest_problems(contest, request_user, profile)
     return {
         'id': contest.id,
         'external_id': contest.key,
@@ -578,8 +638,12 @@ def _contest_row(contest, participation_counts, virtual_participation_counts, su
         'problem_count': len(contest_problems),
         'status': _contest_status(contest),
         'phase': _contest_status(contest),
-        'problems': [_contest_problem_row(item, submission_counts) for item in contest_problems],
-        'myParticipant': _contest_participation_row(my_participation),
+        'problems': [
+            _contest_problem_row(item, submission_counts)
+            for item in contest_problems
+        ] if can_view_problems else [],
+        'problems_available': bool(can_view_problems),
+        'myParticipant': _contest_participation_row(my_participation, frozen=frozen_scoreboard),
     }
 
 
@@ -591,8 +655,11 @@ def _organization_visibility(organization):
     return 'protected'
 
 
-def _organization_admin_usernames(organization):
-    return list(organization.admins.select_related('user').values_list('user__username', flat=True))
+def _organization_admin_usernames(organization, include_unlisted=False):
+    query = organization.admins.select_related('user')
+    if not include_unlisted:
+        query = query.filter(is_unlisted=False)
+    return list(query.values_list('user__username', flat=True))
 
 
 def _organization_membership(organization, profile):
@@ -622,12 +689,16 @@ def _can_view_organization(organization, profile, request_user):
     )
 
 
-def _organization_row(organization, profile, problem_counts, contest_counts):
+def _can_manage_organization(organization, profile, request_user):
+    return bool(request_user.is_staff or (profile and organization.admins.filter(pk=profile.pk).exists()))
+
+
+def _organization_row(organization, profile, problem_counts, contest_counts, include_unlisted_admins=False):
     my_role, my_status = _organization_membership(organization, profile)
     members = list(organization.members.select_related('user').all())
     member_count = int(organization.member_count or 0) or len(members)
     total_rating = sum(int(member.rating or 0) for member in members)
-    admins = _organization_admin_usernames(organization)
+    admins = _organization_admin_usernames(organization, include_unlisted=include_unlisted_admins)
     return {
         'id': organization.id,
         'slug': organization.slug,
@@ -648,17 +719,19 @@ def _organization_row(organization, profile, problem_counts, contest_counts):
     }
 
 
-def _organization_member_row(profile, role='member'):
+def _organization_member_row(profile, role='member', include_email=False):
     user = profile.user
-    return {
+    row = {
         'user_id': user.id,
         'username': user.username,
         'full_name': user.get_full_name() or profile.username_display_override or user.username,
-        'email': user.email or '',
         'role': role,
         'status': 'active',
         'joined_at': getattr(user, 'date_joined', None).isoformat() if getattr(user, 'date_joined', None) else '',
     }
+    if include_email:
+        row['email'] = user.email or ''
+    return row
 
 
 def _organization_problem_row(problem):
@@ -686,12 +759,23 @@ def _organization_contest_row(contest):
     }
 
 
-def _profile_row(profile):
+def _profile_organization(profile, include_unlisted=False):
+    if not include_unlisted and hasattr(profile, 'public_organizations'):
+        organizations = profile.public_organizations
+    else:
+        organizations = profile.organizations.all()
+    for organization in organizations:
+        if include_unlisted or not organization.is_unlisted:
+            return organization
+    return None
+
+
+def _profile_row(profile, include_unlisted_organization=False, submission_count=None):
     user = profile.user
     role = _role_for(profile)
     full_name = user.get_full_name() or profile.username_display_override or user.username
     badges = list(profile.badges.values_list('name', flat=True))
-    org = profile.organization
+    org = _profile_organization(profile, include_unlisted=include_unlisted_organization)
     meta = _read_cppro_meta(profile)
     return {
         'id': profile.id,
@@ -713,7 +797,10 @@ def _profile_row(profile):
         'pp_score': float(profile.performance_points or 0),
         'solved': int(profile.problem_count or 0),
         'accepted': int(profile.problem_count or 0),
-        'submissions': Submission.objects.filter(user=profile).count(),
+        'submissions': int(
+            Submission.objects.filter(user=profile).count()
+            if submission_count is None else submission_count
+        ),
         'current_streak': 0,
         'longest_streak': 0,
         'is_teacher': user.is_staff or user.is_superuser,
@@ -730,8 +817,29 @@ def _profile_row(profile):
     }
 
 
+def _public_profile_row(profile, submission_count=0):
+    row = _profile_row(profile, submission_count=submission_count)
+    row.pop('email', None)
+    return row
+
+
+def _profile_row_for_viewer(profile, request_user, submission_count=None):
+    can_view_email = bool(
+        request_user.is_authenticated
+        and (request_user.id == profile.user_id or request_user.is_staff)
+    )
+    row = _profile_row(
+        profile,
+        include_unlisted_organization=can_view_email,
+        submission_count=submission_count,
+    )
+    if not can_view_email:
+        row.pop('email', None)
+    return row
+
+
 def _auth_user_row(profile):
-    row = _profile_row(profile)
+    row = _profile_row(profile, include_unlisted_organization=True)
     role = row['role']
     return {
         'id': row['user_id'],
@@ -816,12 +924,23 @@ def _submission_detail_row(submission, request_user, include_tests=False, admin_
             source = ''
     testcase_model = apps.get_model('judge', 'SubmissionTestCase')
     testcases = list(testcase_model.objects.filter(submission=submission).order_by('case', 'id')) if can_view_tests and (include_tests or can_view_source) else []
+    can_view_judge_log = bool(
+        can_view_source
+        and (
+            submission.status != 'IE'
+            or request_user.has_perm('judge.view_all_submission')
+            or _can_manage_problem(request_user, submission.problem)
+        )
+    )
     row.update({
         'problem_id': submission.problem_id,
         'contest_id': submission.contest_object_id,
         'code': source,
         'can_view_source': bool(can_view_source),
-        'judge_log': submission.error or '',
+        # Internal errors can contain paths and infrastructure diagnostics.
+        # Native DMOJ only shows them to problem managers; normal compile or
+        # checker feedback remains on the source-material boundary.
+        'judge_log': (submission.error or '') if can_view_judge_log else '',
         'testCases': [_submission_testcase_row(testcase) for testcase in testcases],
         'testcase_count': max(int(submission.case_total or 0), len(testcases)),
         'can_view_test_details': bool(testcases),
@@ -836,11 +955,9 @@ def _submission_detail_row(submission, request_user, include_tests=False, admin_
 
 
 def _submission_list_payload(request):
-    visible = Problem.get_visible_problems(request.user)
     query = (
-        Submission.objects
+        _visible_submission_queryset(request.user)
         .select_related('problem', 'language', 'user__user', 'contest_object')
-        .filter(problem__in=visible)
     )
     profile = _current_profile(request)
     if request.GET.get('scope') == 'mine':
@@ -933,6 +1050,38 @@ def _active_contests_for_problem(problem):
     ).distinct()
 
 
+def _visible_contests_for_user(user):
+    # CPPro management deliberately treats DMOJ staff as platform managers.
+    # Everyone else must use the native private/organization contest filter.
+    if _is_platform_admin(user):
+        return Contest.objects.all()
+    return Contest.get_visible_contests(user)
+
+
+def _visible_submission_queryset(user):
+    query = Submission.objects.all()
+    if _is_platform_admin(user):
+        return query
+
+    visible_problems = Problem.get_visible_problems(user)
+    profile = _current_profile_from_user(user)
+    # The native contest visibility check only answers whether a contest can be
+    # opened. Submission rows additionally require the native submission-list
+    # rule, which prevents scoreboard-hidden and frozen contests from leaking
+    # through this aggregate endpoint.
+    contest_ids = [
+        contest.id
+        for contest in _visible_contests_for_user(user)
+        if contest.can_see_full_submission_list(user)
+    ]
+    visibility = Q(contest_object__isnull=True)
+    if contest_ids:
+        visibility |= Q(contest_object_id__in=contest_ids)
+    if profile:
+        visibility |= Q(user=profile)
+    return query.filter(problem__in=visible_problems).filter(visibility).distinct()
+
+
 def _can_manage_problem(request_user, problem):
     if not request_user.is_authenticated:
         return False
@@ -943,6 +1092,27 @@ def _can_manage_problem(request_user, problem):
     except Exception:
         profile = _current_profile_from_user(request_user)
         return bool(profile and (problem.authors.filter(pk=profile.id).exists() or problem.curators.filter(pk=profile.id).exists()))
+
+
+def _can_view_submission_context(submission, request_user):
+    contest = getattr(submission, 'contest_object', None)
+    if contest is None:
+        return True
+    if not request_user.is_authenticated:
+        return False
+    profile = _current_profile_from_user(request_user)
+    if (
+        (profile and submission.user_id == profile.id)
+        or request_user.has_perm('judge.view_all_submission')
+        or _can_manage_problem(request_user, submission.problem)
+    ):
+        return True
+    if not _visible_contests_for_user(request_user).filter(pk=contest.pk).exists():
+        return False
+    # Seeing a contest page is weaker than seeing other contestants' live
+    # submissions. Honor the native frozen/hidden submission-list boundary for
+    # direct IDs as well as aggregate endpoints.
+    return bool(contest.can_see_full_submission_list(request_user))
 
 
 def _can_view_submission_materials(submission, request_user, admin_context=False):
@@ -1257,6 +1427,7 @@ def _ensure_problem_has_judge(problem):
 @require_GET
 def cppro_data(request):
     profile = _current_profile(request)
+    visible_submissions = _visible_submission_queryset(request.user)
     visible = Problem.get_visible_problems(request.user)
     problems = list(
         visible.select_related('group')
@@ -1264,11 +1435,10 @@ def cppro_data(request):
         .order_by('code')
     )
     submission_counts = {}
-    for problem_id in Submission.objects.filter(problem_id__in=[p.id for p in problems]).values_list('problem_id', flat=True):
+    for problem_id in visible_submissions.filter(problem_id__in=[p.id for p in problems]).values_list('problem_id', flat=True):
         submission_counts[problem_id] = submission_counts.get(problem_id, 0) + 1
     contests = list(
-        Contest.objects
-        .filter(is_visible=True)
+        _visible_contests_for_user(request.user)
         .prefetch_related('contest_problems__problem')
         .order_by('-start_time', 'key')
     )
@@ -1278,13 +1448,7 @@ def cppro_data(request):
         for organization in Organization.objects.prefetch_related('admins__user', 'members__user').order_by('name')
         if _can_view_organization(organization, profile, request.user)
     ]
-    organization_ids = [organization.id for organization in organizations]
-    organization_problem_counts = {organization_id: 0 for organization_id in organization_ids}
-    for organization_id in Problem.objects.filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
-        organization_problem_counts[organization_id] = organization_problem_counts.get(organization_id, 0) + 1
-    organization_contest_counts = {organization_id: 0 for organization_id in organization_ids}
-    for organization_id in Contest.objects.filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
-        organization_contest_counts[organization_id] = organization_contest_counts.get(organization_id, 0) + 1
+    organization_problem_counts, organization_contest_counts = _organization_counts(organizations, request.user)
     user_progress = {}
     if profile:
         for submission in (
@@ -1309,9 +1473,15 @@ def cppro_data(request):
                 progress['best_verdict'] = 'AC'
 
     submissions = list(
-        Submission.objects
+        visible_submissions
         .select_related('problem', 'language', 'user__user', 'contest_object')
         .order_by('-date', '-id')[:200]
+    )
+    visible_submission_counts = dict(
+        visible_submissions
+        .values('user_id')
+        .annotate(total=Count('id'))
+        .values_list('user_id', 'total')
     )
 
     runtime_by_language = {
@@ -1328,39 +1498,47 @@ def cppro_data(request):
         for language in Language.objects.order_by('key')
     ]
     users = [
-        _profile_row(profile)
-        for profile in Profile.objects.select_related('user').prefetch_related('badges', 'organizations').order_by('user__username')
+        _public_profile_row(profile, visible_submission_counts.get(profile.id, 0))
+        for profile in (
+            Profile.objects
+            .select_related('user')
+            .prefetch_related(
+                'badges',
+                Prefetch(
+                    'organizations',
+                    queryset=Organization.objects.filter(is_unlisted=False),
+                    to_attr='public_organizations',
+                ),
+            )
+            .order_by('user__username')
+        )
         if not profile.is_unlisted and profile.user.is_active
     ]
     users.sort(key=lambda row: (-float(row.get('pp_score') or 0), -float(row.get('score') or 0), -int(row.get('solved') or 0), row['username'].lower()))
     problem_rows = [_problem_row(problem, submission_counts, user_progress) for problem in problems]
-    contest_rows = [_contest_row(contest, participation_counts, virtual_participation_counts, submission_counts, profile) for contest in contests]
-    community_post_ids = _registered_post_ids('community')
-    announcement_post_ids = _registered_post_ids('announcement')
-    blog_posts = list(
-        BlogPost.objects
-        .filter(id__in=community_post_ids, visible=True, publish_on__lte=timezone.now())
-        .filter(Q(global_post=True) | Q(organization__isnull=True))
-        .prefetch_related('authors__user')
-        .order_by('-sticky', '-publish_on', '-id')[:24]
-    )
+    contest_rows = [
+        _contest_row(
+            contest,
+            participation_counts,
+            virtual_participation_counts,
+            submission_counts,
+            profile,
+            request.user,
+        )
+        for contest in contests
+    ]
+    blog_posts = _visible_registered_posts('community', request.user)
     post_rows = [_post_row(post) for post in blog_posts]
     notification_post_rows = [
         _post_row(post, 'announcement')
-        for post in (
-            BlogPost.objects
-            .filter(id__in=announcement_post_ids, visible=True, publish_on__lte=timezone.now())
-            .filter(Q(global_post=True) | Q(organization__isnull=True))
-            .prefetch_related('authors__user')
-            .order_by('-sticky', '-publish_on', '-id')[:24]
-        )
+        for post in _visible_registered_posts('announcement', request.user)
     ]
     announcement_rows = [
         _contest_announcement_row(announcement)
         for announcement in (
             ContestAnnouncement.objects
             .select_related('contest')
-            .filter(contest__is_visible=True)
+            .filter(contest_id__in=[contest.id for contest in contests])
             .order_by('-date', '-id')[:24]
         )
     ]
@@ -1376,15 +1554,15 @@ def cppro_data(request):
     except LookupError:
         quiz_rows = []
     traffic = _home_traffic_snapshot()
-    accepted_submissions = Submission.objects.filter(result='AC').count()
-    total_submissions = Submission.objects.count()
+    accepted_submissions = visible_submissions.filter(result='AC').count()
+    total_submissions = visible_submissions.count()
     challenge = problem_rows[timezone.localdate().toordinal() % len(problem_rows)] if problem_rows else None
     payload = {
         'generatedAt': timezone.now().isoformat(),
         'source': 'lcoj-database',
         'stats': {
             'problems': len(problems),
-            'submissions': Submission.objects.count(),
+            'submissions': total_submissions,
             'contests': len(contests),
             'organizations': len(organizations),
             'languages': len(languages),
@@ -1398,11 +1576,24 @@ def cppro_data(request):
         'problems': problem_rows,
         'contests': contest_rows,
         'contestDetails': {
-            contest.key: _contest_row(contest, participation_counts, virtual_participation_counts, submission_counts, profile)
+            contest.key: _contest_row(
+                contest,
+                participation_counts,
+                virtual_participation_counts,
+                submission_counts,
+                profile,
+                request.user,
+            )
             for contest in contests
         },
         'organizations': [
-            _organization_row(organization, profile, organization_problem_counts, organization_contest_counts)
+            _organization_row(
+                organization,
+                profile,
+                organization_problem_counts,
+                organization_contest_counts,
+                include_unlisted_admins=_can_manage_organization(organization, profile, request.user),
+            )
             for organization in organizations
         ],
         'submissions': [_submission_row(submission) for submission in submissions],
@@ -1413,7 +1604,7 @@ def cppro_data(request):
         'notifications': announcement_rows + notification_post_rows,
         'quizzes': quiz_rows,
         'homeSummary': {
-            'activity': _home_activity_rows(),
+            'activity': _home_activity_rows(visible_submissions),
             'streak': {'current': 0, 'longest': 0},
             'challenge': challenge,
             'presence': {'online': len(traffic['presence']), 'total': len(users)},
@@ -1465,10 +1656,9 @@ def cppro_home_visit(request):
     }, json_dumps_params={'ensure_ascii': False})
 
 
-def _find_visible_contest(identifier):
+def _find_visible_contest(identifier, request_user):
     query = (
-        Contest.objects
-        .filter(is_visible=True)
+        _visible_contests_for_user(request_user)
         .prefetch_related('contest_problems__problem')
     )
     contest = None
@@ -1485,18 +1675,33 @@ def _contest_payload(request, contest):
     profile = _current_profile(request)
     submission_counts = {}
     problem_ids = list(contest.contest_problems.values_list('problem_id', flat=True))
-    for problem_id in Submission.objects.filter(problem_id__in=problem_ids).values_list('problem_id', flat=True):
+    for problem_id in _visible_submission_queryset(request.user).filter(problem_id__in=problem_ids).values_list('problem_id', flat=True):
         submission_counts[problem_id] = submission_counts.get(problem_id, 0) + 1
     participation_counts, virtual_participation_counts = _contest_participation_counts([contest.id])
-    row = _contest_row(contest, participation_counts, virtual_participation_counts, submission_counts, profile)
-    participant_rows = list(
-        ContestParticipation.objects
-        .filter(contest=contest, virtual__gte=ContestParticipation.LIVE, user__user__is_active=True)
-        .select_related('user__user')
-        .order_by('virtual', 'real_start', 'id')[:250]
+    can_view_full, _, frozen = _contest_scoreboard_access(contest, request.user)
+    row = _contest_row(
+        contest,
+        participation_counts,
+        virtual_participation_counts,
+        submission_counts,
+        profile,
+        request.user,
     )
-    row['participant_users'] = [_contest_participant_row(participation) for participation in participant_rows]
-    row['participant_users_truncated'] = row['participant_total'] > len(participant_rows)
+    row['participant_users'] = []
+    row['participant_users_truncated'] = False
+    row['participant_users_available'] = bool(can_view_full)
+    if can_view_full:
+        participant_rows = list(
+            ContestParticipation.objects
+            .filter(contest=contest, virtual__gte=ContestParticipation.LIVE, user__user__is_active=True)
+            .select_related('user__user')
+            .order_by('virtual', 'real_start', 'id')[:250]
+        )
+        row['participant_users'] = [
+            _contest_participant_row(participation, frozen=frozen)
+            for participation in participant_rows
+        ]
+        row['participant_users_truncated'] = row['participant_total'] > len(participant_rows)
     return {'contest': row, **row}
 
 
@@ -1699,15 +1904,18 @@ def _apply_contest_payload(contest, payload):
 @require_http_methods(['GET', 'POST'])
 def cppro_contests(request):
     if request.method == 'GET':
-        query = Contest.objects.prefetch_related('contest_problems__problem').order_by('-start_time', 'key')
-        if not (request.user.is_authenticated and request.user.is_staff):
-            query = query.filter(is_visible=True)
+        query = _visible_contests_for_user(request.user).prefetch_related('contest_problems__problem').order_by('-start_time', 'key')
         contests = list(query[:500])
         participation_counts, virtual_counts = _contest_participation_counts([item.id for item in contests])
         submission_counts = {}
-        for problem_id in Submission.objects.filter(contest_object_id__in=[item.id for item in contests]).values_list('problem_id', flat=True):
+        for problem_id in _visible_submission_queryset(request.user).filter(
+            contest_object_id__in=[item.id for item in contests],
+        ).values_list('problem_id', flat=True):
             submission_counts[problem_id] = submission_counts.get(problem_id, 0) + 1
-        rows = [_contest_row(item, participation_counts, virtual_counts, submission_counts, _current_profile(request)) for item in contests]
+        rows = [
+            _contest_row(item, participation_counts, virtual_counts, submission_counts, _current_profile(request), request.user)
+            for item in contests
+        ]
         return JsonResponse({'rows': rows, 'total': query.count()}, json_dumps_params={'ensure_ascii': False})
     denied = _require_platform_admin(request)
     if denied:
@@ -1740,7 +1948,7 @@ def cppro_contests(request):
 @require_http_methods(['GET', 'PATCH', 'PUT', 'DELETE'])
 def cppro_contest_detail(request, identifier):
     if request.method == 'GET':
-        contest = _admin_contest(identifier) if request.user.is_authenticated and request.user.is_staff else _find_visible_contest(identifier)
+        contest = _find_visible_contest(identifier, request.user)
         if not contest:
             return _json_error('Contest not found.', 404)
         return JsonResponse(_contest_payload(request, contest), json_dumps_params={'ensure_ascii': False})
@@ -1858,24 +2066,26 @@ def _record_contest_problem_result(problem_results, participation, contest_probl
 
 @require_GET
 def cppro_contest_standings(request, identifier):
-    contest = _find_visible_contest(identifier)
+    contest = _find_visible_contest(identifier, request.user)
     if not contest:
         return _json_error('Contest not found.', 404)
-    if not contest.can_see_own_scoreboard(request.user):
+    if not (_is_platform_admin(request.user) or contest.can_see_own_scoreboard(request.user)):
         return _json_error('Contest scoreboard is not available.', 403)
 
     profile = _current_profile(request)
-    can_view_full = contest.can_see_full_scoreboard(request.user)
-    can_edit = bool(
-        request.user.is_authenticated
-        and (request.user.is_superuser or contest.is_editable_by(request.user))
-    )
-    frozen = bool(contest.is_frozen and not can_edit)
+    can_view_full, can_edit, frozen = _contest_scoreboard_access(contest, request.user)
 
     participations = (
         ContestParticipation.objects
         .filter(contest=contest, virtual=ContestParticipation.LIVE)
         .select_related('contest', 'user__user')
+        .prefetch_related(
+            Prefetch(
+                'user__organizations',
+                queryset=Organization.objects.filter(is_unlisted=False),
+                to_attr='public_organizations',
+            ),
+        )
         .annotate(submission_count=Count('submission'))
     )
     if not can_view_full:
@@ -2021,7 +2231,7 @@ def cppro_contest_standings(request, identifier):
             visible_rank = index
             last_rank_key = rank_key
         user = participation.user.user
-        organization = getattr(participation.user, 'organization', None)
+        organization = _profile_organization(participation.user)
         rows.append({
             'rank': visible_rank,
             'participation_id': participation.id,
@@ -2080,7 +2290,7 @@ def cppro_contest_join(request, identifier):
     if not profile:
         return _json_error('Authentication required.', 401)
 
-    contest = _find_visible_contest(identifier)
+    contest = _find_visible_contest(identifier, request.user)
     if not contest:
         return _json_error('Contest not found.', 404)
 
@@ -2134,6 +2344,13 @@ def cppro_contest_join(request, identifier):
         else:
             return _json_error('Contest is not currently open for joining.', 400)
     else:
+        existing_live = ContestParticipation.objects.filter(
+            contest=contest,
+            user=profile,
+            virtual=ContestParticipation.LIVE,
+        ).first()
+        if contest.require_registration and not contest.can_register and existing_live is None:
+            return _json_error('Contest registration is required before joining.', 403)
         participation, _ = ContestParticipation.objects.get_or_create(
             contest=contest,
             user=profile,
@@ -2150,10 +2367,11 @@ def cppro_contest_join(request, identifier):
 
     contest._updating_stats_only = True
     contest.update_user_count()
-    contest = _find_visible_contest(identifier) or contest
+    contest = _find_visible_contest(identifier, request.user) or contest
     response = _contest_payload(request, contest)
     response['joined'] = True
-    response['participation'] = _contest_participation_row(participation)
+    _, _, frozen = _contest_scoreboard_access(contest, request.user)
+    response['participation'] = _contest_participation_row(participation, frozen=frozen)
     return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
 
 
@@ -2164,7 +2382,7 @@ def cppro_contest_leave(request, identifier):
     if not profile:
         return _json_error('Authentication required.', 401)
 
-    contest = _find_visible_contest(identifier)
+    contest = _find_visible_contest(identifier, request.user)
     if not contest:
         return _json_error('Contest not found.', 404)
 
@@ -2175,7 +2393,7 @@ def cppro_contest_leave(request, identifier):
     # Match DMOJ's native leave behavior: preserve the participation history but
     # clear the active contest pointer so submissions are no longer contest-bound.
     profile.remove_contest()
-    contest = _find_visible_contest(identifier) or contest
+    contest = _find_visible_contest(identifier, request.user) or contest
     response = _contest_payload(request, contest)
     response['joined'] = False
     response['participation'] = None
@@ -2197,13 +2415,13 @@ def _find_organization(request, identifier):
     return organization, profile
 
 
-def _organization_counts(organizations):
+def _organization_counts(organizations, request_user):
     organization_ids = [organization.id for organization in organizations]
     problem_counts = {organization_id: 0 for organization_id in organization_ids}
     contest_counts = {organization_id: 0 for organization_id in organization_ids}
-    for organization_id in Problem.objects.filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
+    for organization_id in Problem.get_visible_problems(request_user).filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
         problem_counts[organization_id] = problem_counts.get(organization_id, 0) + 1
-    for organization_id in Contest.objects.filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
+    for organization_id in _visible_contests_for_user(request_user).filter(organizations__id__in=organization_ids).values_list('organizations__id', flat=True):
         contest_counts[organization_id] = contest_counts.get(organization_id, 0) + 1
     return problem_counts, contest_counts
 
@@ -2216,9 +2434,15 @@ def cppro_organizations(request):
         for organization in Organization.objects.prefetch_related('admins__user', 'members__user').order_by('name')
         if _can_view_organization(organization, profile, request.user)
     ]
-    problem_counts, contest_counts = _organization_counts(organizations)
+    problem_counts, contest_counts = _organization_counts(organizations, request.user)
     rows = [
-        _organization_row(organization, profile, problem_counts, contest_counts)
+        _organization_row(
+            organization,
+            profile,
+            problem_counts,
+            contest_counts,
+            include_unlisted_admins=_can_manage_organization(organization, profile, request.user),
+        )
         for organization in organizations
     ]
     return JsonResponse({'rows': rows, 'total': len(rows)}, json_dumps_params={'ensure_ascii': False})
@@ -2259,8 +2483,17 @@ def cppro_admin_organizations(request, identifier=None):
         organizations = [organization] if organization else list(
             Organization.objects.prefetch_related('admins__user', 'members__user').order_by('name')
         )
-        problem_counts, contest_counts = _organization_counts(organizations)
-        rows = [_organization_row(item, profile, problem_counts, contest_counts) for item in organizations]
+        problem_counts, contest_counts = _organization_counts(organizations, request.user)
+        rows = [
+            _organization_row(
+                item,
+                profile,
+                problem_counts,
+                contest_counts,
+                include_unlisted_admins=_can_manage_organization(item, profile, request.user),
+            )
+            for item in organizations
+        ]
         return JsonResponse({'rows': rows, 'total': len(rows)}, json_dumps_params={'ensure_ascii': False})
 
     payload = _parse_json_body(request)
@@ -2303,9 +2536,17 @@ def cppro_admin_organizations(request, identifier=None):
     organizations = [
         Organization.objects.prefetch_related('admins__user', 'members__user').get(pk=organization.pk)
     ]
-    problem_counts, contest_counts = _organization_counts(organizations)
+    problem_counts, contest_counts = _organization_counts(organizations, request.user)
     return JsonResponse(
-        {'organization': _organization_row(organizations[0], profile, problem_counts, contest_counts)},
+        {
+            'organization': _organization_row(
+                organizations[0],
+                profile,
+                problem_counts,
+                contest_counts,
+                include_unlisted_admins=_can_manage_organization(organizations[0], profile, request.user),
+            ),
+        },
         status=201 if request.method == 'POST' else 200,
         json_dumps_params={'ensure_ascii': False},
     )
@@ -2317,18 +2558,24 @@ def cppro_organization_detail(request, identifier):
     if not organization:
         return _json_error('Organization not found.', 404)
     visible_problems = Problem.get_visible_problems(request.user).filter(organizations=organization).order_by('code')
-    visible_contests = Contest.objects.filter(is_visible=True, organizations=organization).order_by('-start_time', 'key')
+    visible_contests = _visible_contests_for_user(request.user).filter(organizations=organization).order_by('-start_time', 'key')
     problem_counts = {organization.id: visible_problems.count()}
     contest_counts = {organization.id: visible_contests.count()}
+    can_manage = _can_manage_organization(organization, profile, request.user)
     members = []
     admin_ids = set(organization.admins.values_list('id', flat=True))
     member_profile_ids = set()
-    for member in organization.members.select_related('user').order_by('user__username')[:100]:
+    member_query = organization.members.select_related('user').order_by('user__username')
+    if not can_manage:
+        member_query = member_query.filter(is_unlisted=False)
+    for member in member_query[:100]:
         member_profile_ids.add(member.id)
-        members.append(_organization_member_row(member, 'admin' if member.id in admin_ids else 'member'))
+        members.append(_organization_member_row(member, 'admin' if member.id in admin_ids else 'member', include_email=can_manage))
     for admin in organization.admins.select_related('user').order_by('user__username'):
+        if not can_manage and admin.is_unlisted:
+            continue
         if admin.id not in member_profile_ids:
-            members.insert(0, _organization_member_row(admin, 'admin'))
+            members.insert(0, _organization_member_row(admin, 'admin', include_email=can_manage))
     pending = None
     if profile:
         request_row = OrganizationRequest.objects.filter(user=profile, organization=organization).order_by('-time').first()
@@ -2340,9 +2587,15 @@ def cppro_organization_detail(request, identifier):
                 'reason': request_row.reason or '',
             }
     return JsonResponse({
-        'organization': _organization_row(organization, profile, problem_counts, contest_counts),
+        'organization': _organization_row(
+            organization,
+            profile,
+            problem_counts,
+            contest_counts,
+            include_unlisted_admins=can_manage,
+        ),
         'canAccess': True,
-        'canManage': bool(request.user.is_staff or (profile and organization.admins.filter(pk=profile.pk).exists())),
+        'canManage': can_manage,
         'myJoinRequest': pending,
         'members': members,
         'problems': [_organization_problem_row(problem) for problem in visible_problems[:100]],
@@ -2395,6 +2648,15 @@ def cppro_submission_detail(request, submission_id):
     )
     if not submission:
         return _json_error('Submission not found.', 404)
+    # Match the legacy submission-detail boundary before returning even
+    # metadata. A CPPro manager is also allowed through the bridge-specific
+    # server permission check; this is rechecked server-side, never trusted
+    # from the client's admin query flag.
+    if not (
+        (submission.can_see_detail(request.user) or _can_manage_problem(request.user, submission.problem))
+        and _can_view_submission_context(submission, request.user)
+    ):
+        return _json_error('Submission not found.', 404)
     include_tests = str(request.GET.get('includeTests') or '').lower() == 'all'
     admin_context = str(request.GET.get('admin') or '').lower() in {'1', 'true', 'yes'}
     return JsonResponse(
@@ -2405,17 +2667,35 @@ def cppro_submission_detail(request, submission_id):
 
 @require_GET
 def cppro_profile_detail(request, username):
-    query = Profile.objects.select_related('user').prefetch_related('badges', 'organizations')
+    query = (
+        Profile.objects
+        .select_related('user')
+        .prefetch_related(
+            'badges',
+            'organizations',
+            Prefetch(
+                'organizations',
+                queryset=Organization.objects.filter(is_unlisted=False),
+                to_attr='public_organizations',
+            ),
+        )
+    )
     if str(username).isdigit():
         profile = query.filter(id=int(username)).first() or query.filter(user_id=int(username)).first()
     else:
         profile = query.filter(user__username=username).first()
     if not profile or profile.is_unlisted or not profile.user.is_active:
         return _json_error('User not found.', 404)
-    stats = _profile_row(profile)
+    visible_profile_submissions = _visible_submission_queryset(request.user).filter(user=profile)
+    stats = _profile_row_for_viewer(
+        profile,
+        request.user,
+        submission_count=visible_profile_submissions.count(),
+    )
     recent = [
         _submission_row(item)
-        for item in Submission.objects.filter(user=profile).select_related('problem', 'language', 'user__user').order_by('-date')[:20]
+        for item in visible_profile_submissions
+        .select_related('problem', 'language', 'user__user').order_by('-date')[:20]
     ]
     return JsonResponse({
         'user': stats,
@@ -2479,7 +2759,7 @@ def cppro_create_submission(request):
     contest = None
     contest_identifier = payload.get('contestId') or payload.get('contest_id') or payload.get('contestSlug') or payload.get('contest_slug')
     if contest_identifier:
-        contest_query = Contest.objects.all()
+        contest_query = _visible_contests_for_user(request.user)
         if str(contest_identifier).isdigit():
             contest = contest_query.filter(id=int(contest_identifier)).first()
         if contest is None:
@@ -2517,9 +2797,10 @@ def cppro_create_submission(request):
     try:
         submission.judge(force_judge=True)
     except Exception as exc:
-        judge_warning = str(exc)[:400]
+        internal_error = str(exc)[:400]
+        judge_warning = 'The submission could not be queued for judging. Please try again shortly.'
         submission.status = 'IE'
-        submission.error = judge_warning
+        submission.error = internal_error
         submission.save(update_fields=['status', 'error'])
 
     submission = Submission.objects.select_related('problem', 'language', 'user__user', 'contest_object').get(pk=submission.pk)
@@ -3458,7 +3739,7 @@ def cppro_problems(request, identifier=None):
 
 
 def _management_user_row(profile):
-    row = _profile_row(profile)
+    row = _profile_row(profile, include_unlisted_organization=True)
     user = profile.user
     meta = _read_cppro_meta(profile)
     row.update({
@@ -3620,7 +3901,10 @@ def _management_rows(request, section):
         contests = list(Contest.objects.prefetch_related('contest_problems__problem').order_by('-start_time', 'key')[:500])
         participation_counts, virtual_counts = _contest_participation_counts([item.id for item in contests])
         submission_counts = {}
-        rows = [_contest_row(item, participation_counts, virtual_counts, submission_counts, _current_profile(request)) for item in contests]
+        rows = [
+            _contest_row(item, participation_counts, virtual_counts, submission_counts, _current_profile(request), request.user)
+            for item in contests
+        ]
         return {'rows': rows, 'total': Contest.objects.count()}
     if section == 'submissions':
         query = Submission.objects.select_related('problem', 'language', 'user__user', 'contest_object').order_by('-date', '-id')
@@ -3999,12 +4283,12 @@ def cppro_admin_management(request, section, identifier=None):
     return _json_error('This management operation is not supported.', 405)
 
 
-def _find_blog_post(identifier):
+def _find_blog_post(request, identifier):
     community_ids = _registered_post_ids('community')
     post = BlogPost.objects.filter(id=int(identifier), id__in=community_ids).first() if str(identifier).isdigit() else None
     if post is None:
         post = BlogPost.objects.filter(slug=str(identifier), id__in=community_ids).first()
-    return post
+    return post if post and post.can_see(request.user) else None
 
 
 def _post_comment_config_key(post):
@@ -4023,7 +4307,7 @@ def _save_post_comment_rows(post, rows):
 @csrf_protect
 @require_http_methods(['GET', 'POST'])
 def cppro_post_social(request, post_id, resource):
-    post = _find_blog_post(post_id)
+    post = _find_blog_post(request, post_id)
     if not post:
         return _json_error('Post not found.', 404)
     resource = str(resource or '').strip().lower()
@@ -4050,7 +4334,7 @@ def cppro_post_social(request, post_id, resource):
 @csrf_protect
 @require_http_methods(['GET', 'POST'])
 def cppro_post_comments(request, identifier, comment_id=None, action=None):
-    post = _find_blog_post(identifier)
+    post = _find_blog_post(request, identifier)
     if not post:
         return _json_error('Post not found.', 404)
     rows = _post_comment_rows(post)
