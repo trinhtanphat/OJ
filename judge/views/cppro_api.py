@@ -1,10 +1,12 @@
 import json
 import os
 import re
+import secrets
+import uuid
 from io import BytesIO
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from urllib.parse import urlsplit
-from zipfile import BadZipFile, ZipFile
+from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 from django.apps import apps
 from django.conf import settings
@@ -17,7 +19,7 @@ from django.core.files.base import ContentFile
 from django.core.mail.backends.smtp import EmailBackend
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Max, Prefetch, Q, Sum
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from django.utils import timezone
@@ -43,6 +45,11 @@ CPPRO_SMTP_SETTINGS_KEY = 'cppro_smtp_settings'
 CPPRO_HOME_TRAFFIC_KEY = 'cppro_home_traffic'
 CPPRO_RATING_SETTINGS_KEY = 'cppro_rating_settings'
 CPPRO_POST_REGISTRY_KEY = 'cppro_post_registry'
+CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY = 'cppro_submission_verification'
+CPPRO_SUBMISSION_VERIFICATION_TTL_SECONDS = 5 * 60
+CPPRO_TESTCASE_ARCHIVE_MAX_FILES = 500
+CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES = 4 * 1024 * 1024
+CPPRO_TESTCASE_ARCHIVE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
 
 def _cppro_post_registry():
@@ -892,11 +899,23 @@ def _submission_row(submission):
     }
 
 
-def _submission_testcase_row(testcase):
+def _submission_problem_testcase_materials(problem):
+    return {
+        index: {
+            'input': row.get('input', ''),
+            'output': row.get('output', ''),
+        }
+        for index, row in enumerate(_problem_testcase_material_rows(problem))
+    }
+
+
+def _submission_testcase_row(testcase, materials=None):
+    case_index = int(testcase.case or 0)
+    material = (materials or {}).get(case_index, {})
     return {
         'id': testcase.id,
-        'index': int(testcase.case or 0) + 1,
-        'case_id': int(testcase.case or 0),
+        'index': case_index + 1,
+        'case_id': case_index,
         'verdict': testcase.status or 'NOT_RUN',
         'status': testcase.status or 'NOT_RUN',
         'runtime': float(testcase.time or 0) * 1000,
@@ -904,6 +923,10 @@ def _submission_testcase_row(testcase):
         'point': float(testcase.points or 0),
         'score': float(testcase.points or 0),
         'message': testcase.feedback or testcase.extended_feedback or '',
+        # The management-only material boundary is checked by the caller.
+        # `output` is the expected answer; `actual` remains the program output.
+        'input': material.get('input', ''),
+        'output': material.get('output', ''),
         'actual': testcase.output or '',
         'stderr': testcase.extended_feedback or '',
     }
@@ -925,6 +948,11 @@ def _submission_detail_row(submission, request_user, include_tests=False, admin_
             source = ''
     testcase_model = apps.get_model('judge', 'SubmissionTestCase')
     testcases = list(testcase_model.objects.filter(submission=submission).order_by('case', 'id')) if can_view_tests and (include_tests or can_view_source) else []
+    # Per-case input and expected output are stricter than a submitter's own
+    # result visibility. Only a problem manager can inspect hidden judge data.
+    testcase_materials = _submission_problem_testcase_materials(submission.problem) if (
+        testcases and _can_manage_problem(request_user, submission.problem)
+    ) else {}
     can_view_judge_log = bool(
         can_view_source
         and (
@@ -942,7 +970,7 @@ def _submission_detail_row(submission, request_user, include_tests=False, admin_
         # Native DMOJ only shows them to problem managers; normal compile or
         # checker feedback remains on the source-material boundary.
         'judge_log': (submission.error or '') if can_view_judge_log else '',
-        'testCases': [_submission_testcase_row(testcase) for testcase in testcases],
+        'testCases': [_submission_testcase_row(testcase, testcase_materials) for testcase in testcases],
         'testcase_count': max(int(submission.case_total or 0), len(testcases)),
         'can_view_test_details': bool(testcases),
         'visible_testcase_scope': 'all' if testcases else 'summary',
@@ -2737,6 +2765,83 @@ def cppro_profile_detail(request, username):
     }, json_dumps_params={'ensure_ascii': False})
 
 
+def _submission_verification_question():
+    """Return a small arithmetic challenge whose answer always stays in 0..30."""
+    operator = secrets.choice(('+', '-', '×'))
+    if operator == '+':
+        left = secrets.randbelow(31)
+        right = secrets.randbelow(31 - left)
+        answer = left + right
+    elif operator == '-':
+        left = secrets.randbelow(31)
+        right = secrets.randbelow(left + 1)
+        answer = left - right
+    else:
+        factors = [(left, right) for left in range(1, 31) for right in range(1, 31) if left * right <= 30]
+        left, right = secrets.choice(factors)
+        answer = left * right
+    return '%d %s %d = ?' % (left, operator, right), answer
+
+
+def _issue_submission_verification(request, profile):
+    prompt, answer = _submission_verification_question()
+    expires_at = timezone.now() + timedelta(seconds=CPPRO_SUBMISSION_VERIFICATION_TTL_SECONDS)
+    challenge_id = uuid.uuid4().hex
+    request.session[CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY] = {
+        'challenge_id': challenge_id,
+        'profile_id': profile.id,
+        'answer': answer,
+        'expires_at': expires_at.isoformat(),
+    }
+    request.session.modified = True
+    return {
+        'challengeId': challenge_id,
+        'prompt': prompt,
+        'expiresAt': expires_at.isoformat(),
+    }
+
+
+def _consume_submission_verification(request, profile, payload):
+    challenge_id = str(payload.get('verificationChallengeId') or payload.get('verification_challenge_id') or '').strip()
+    raw_answer = payload.get('verificationAnswer', payload.get('verification_answer'))
+    state = request.session.get(CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY)
+    if not challenge_id or not isinstance(state, dict):
+        return 'Create and solve the verification challenge before submitting.'
+    try:
+        challenge_profile_id = int(state.get('profile_id') or 0)
+        expected_answer = int(state.get('answer'))
+    except (TypeError, ValueError):
+        request.session.pop(CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, None)
+        request.session.modified = True
+        return 'This verification challenge is no longer valid. Please create a new one.'
+    if str(state.get('challenge_id') or '') != challenge_id or challenge_profile_id != profile.id:
+        return 'This verification challenge is not valid for the current account.'
+
+    # A challenge is one-time even when the answer is wrong. This keeps the
+    # endpoint from becoming an answer oracle and makes refresh behavior clear.
+    request.session.pop(CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, None)
+    request.session.modified = True
+    expires_at = parse_datetime(str(state.get('expires_at') or ''))
+    if not expires_at or expires_at <= timezone.now():
+        return 'This verification challenge has expired. Please create a new one.'
+    try:
+        answer = int(raw_answer)
+    except (TypeError, ValueError):
+        return 'The verification answer must be a whole number.'
+    if isinstance(raw_answer, bool) or answer != expected_answer:
+        return 'The verification answer is incorrect. Please create a new challenge.'
+    return None
+
+
+@csrf_protect
+@require_http_methods(['POST'])
+def cppro_submission_verification_challenge(request):
+    profile = _current_profile(request)
+    if not profile:
+        return _json_error('Authentication required.', 401)
+    return JsonResponse(_issue_submission_verification(request, profile), status=201, json_dumps_params={'ensure_ascii': False})
+
+
 @csrf_protect
 @require_http_methods(['GET', 'POST'])
 def cppro_create_submission(request):
@@ -2782,6 +2887,10 @@ def cppro_create_submission(request):
     allowed_languages = problem.allowed_languages.all()
     if allowed_languages.exists() and not allowed_languages.filter(pk=language.pk).exists():
         return _json_error('This language is not enabled for the problem.', 400)
+
+    verification_error = _consume_submission_verification(request, profile, payload)
+    if verification_error:
+        return _json_error(verification_error, 400)
 
     contest = None
     contest_identifier = payload.get('contestId') or payload.get('contest_id') or payload.get('contestSlug') or payload.get('contest_slug')
@@ -3011,6 +3120,93 @@ def _problem_data_archive_files(data):
         return []
 
 
+def _safe_problem_archive_name(value):
+    name = str(value or '').strip().replace('\\', '/')
+    if not name or name.startswith('/') or ':' in name.split('/')[0]:
+        raise ValueError('Archive contains an invalid file name.')
+    parts = name.split('/')
+    if any(part in {'', '.', '..'} for part in parts):
+        raise ValueError('Archive file paths must stay inside the package.')
+    return '/'.join(parts)
+
+
+def _read_problem_archive_entries(source):
+    """Read a bounded ZIP into a case-insensitive-safe name -> bytes mapping."""
+    try:
+        with ZipFile(source) as archive:
+            entries = {}
+            normalized_names = set()
+            total_size = 0
+            for info in archive.infolist():
+                if info.is_dir() or not info.filename:
+                    continue
+                if info.flag_bits & 0x1:
+                    raise ValueError('Encrypted ZIP entries are not supported.')
+                name = _safe_problem_archive_name(info.filename)
+                name_key = name.casefold()
+                if name_key in normalized_names:
+                    raise ValueError('Archive contains duplicate file names.')
+                if info.file_size < 0 or info.file_size > CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES:
+                    raise ValueError('Each archive file must be at most 4 MB.')
+                total_size += info.file_size
+                if total_size > CPPRO_TESTCASE_ARCHIVE_MAX_TOTAL_BYTES:
+                    raise ValueError('The extracted archive must be at most 32 MB.')
+                if len(entries) >= CPPRO_TESTCASE_ARCHIVE_MAX_FILES:
+                    raise ValueError('The archive may contain at most 500 files.')
+                with archive.open(info) as handle:
+                    content = handle.read(CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES + 1)
+                if len(content) > CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES:
+                    raise ValueError('Each archive file must be at most 4 MB.')
+                entries[name] = content
+                normalized_names.add(name_key)
+            return entries
+    except BadZipFile:
+        raise ValueError('The uploaded file is not a valid ZIP archive.')
+
+
+def _problem_data_archive_entries(data):
+    if not data or not data.zipfile:
+        return {}
+    try:
+        with data.zipfile.storage.open(data.zipfile.name, 'rb') as handle:
+            return _read_problem_archive_entries(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _archive_entry_text(entries, filename, limit=None):
+    if not filename:
+        return ''
+    content = entries.get(str(filename))
+    if content is None:
+        filename_key = str(filename).casefold()
+        content = next((value for name, value in entries.items() if name.casefold() == filename_key), None)
+    if content is None:
+        return ''
+    visible_limit = limit if limit is not None else int(getattr(settings, 'VNOJ_TESTCASE_VISIBLE_LENGTH', 65536) or 65536)
+    truncated = len(content) > visible_limit
+    text = content[:visible_limit].decode('utf-8', errors='replace')
+    return text + ('\n… [truncated]' if truncated else '')
+
+
+def _testcase_file_pairs(valid_files):
+    file_map = {str(name).casefold(): str(name) for name in valid_files}
+    pairs = []
+    output_extensions = {
+        '.in': ('.out', '.ans', '.output'),
+        '.inp': ('.out', '.ans', '.output'),
+        '.input': ('.out', '.ans', '.output'),
+    }
+    for input_name in sorted(valid_files, key=_natural_file_key):
+        stem, extension = os.path.splitext(str(input_name))
+        for output_extension in output_extensions.get(extension.casefold(), ()):
+            output_name = file_map.get((stem + output_extension).casefold())
+            if output_name:
+                pairs.append((str(input_name), output_name))
+                break
+    return pairs
+
+
 def _problem_data_grader_args(data):
     raw = getattr(data, 'grader_args', '') or ''
     try:
@@ -3027,20 +3223,7 @@ def _natural_file_key(value):
 def _auto_testcase_rows(problem, valid_files):
     # Pair conventional input/output file names in the archive so a newly
     # uploaded ZIP can immediately be compiled into the judge's init.yml.
-    file_map = {str(name).casefold(): str(name) for name in valid_files}
-    pairs = []
-    output_extensions = {
-        '.in': ('.out', '.ans', '.output'),
-        '.inp': ('.out', '.ans', '.output'),
-        '.input': ('.out', '.ans', '.output'),
-    }
-    for input_name in sorted(valid_files, key=_natural_file_key):
-        stem, extension = os.path.splitext(str(input_name))
-        for output_extension in output_extensions.get(extension.casefold(), ()):
-            output_name = file_map.get((stem + output_extension).casefold())
-            if output_name:
-                pairs.append((str(input_name), output_name))
-                break
+    pairs = _testcase_file_pairs(valid_files)
     if not pairs:
         return []
     total_points = int(round(float(problem.points or 0)))
@@ -3192,8 +3375,8 @@ def _compile_problem_data(problem, data, valid_files):
     return str(data.feedback or '')
 
 
-def _admin_testcase_row(case):
-    return {
+def _admin_testcase_row(case, archive_entries=None):
+    row = {
         'id': case.id,
         'order': int(case.order or 0),
         'type': case.type,
@@ -3204,6 +3387,26 @@ def _admin_testcase_row(case):
         'checker': case.checker or '',
         'generator_args': case.generator_args or '',
     }
+    if archive_entries is not None and case.type == 'C':
+        row.update({
+            'input': _archive_entry_text(archive_entries, case.input_file),
+            'output': _archive_entry_text(archive_entries, case.output_file),
+            'isSample': bool(case.is_pretest),
+        })
+    return row
+
+
+def _problem_testcase_material_rows(problem):
+    try:
+        data = problem.data_files
+    except ProblemData.DoesNotExist:
+        data = None
+    archive_entries = _problem_data_archive_entries(data)
+    return [
+        _admin_testcase_row(case, archive_entries)
+        for case in problem.cases.order_by('order', 'id')
+        if case.type == 'C'
+    ]
 
 
 def _admin_ticket_row(ticket):
@@ -3266,7 +3469,9 @@ def _admin_problem_action_payload(request, problem, action):
     }
     if action == 'testcases':
         base['data'] = _admin_problem_data_row(problem)
-        base['testcases'] = [_admin_testcase_row(case) for case in problem.cases.order_by('order', 'id')]
+        # CPPro's editor needs the actual content to make an existing problem
+        # editable. This action is protected by _admin_problem_from_identifier.
+        base['testcases'] = _problem_testcase_material_rows(problem)
     elif action == 'tickets':
         content_type = ContentType.objects.get_for_model(Problem)
         base['tickets'] = [
@@ -3549,6 +3754,200 @@ def cppro_problem_admin(request, identifier, action):
 
     problem = Problem.objects.select_related('group').prefetch_related('types', 'allowed_languages', 'authors__user', 'curators__user').get(pk=problem.pk)
     return JsonResponse(_admin_problem_action_payload(request, problem, action), json_dumps_params={'ensure_ascii': False})
+
+
+def _save_problem_archive(problem, data, entries):
+    buffer = BytesIO()
+    with ZipFile(buffer, 'w', compression=ZIP_DEFLATED) as archive:
+        for name in sorted(entries, key=_natural_file_key):
+            archive.writestr(name, entries[name])
+    data.zipfile.save('%s-tests.zip' % problem.code, ContentFile(buffer.getvalue()), save=False)
+    data.save()
+
+
+def _problem_case_file_names(problem):
+    names = set()
+    for case in problem.cases.filter(type='C'):
+        if case.input_file:
+            names.add(str(case.input_file).casefold())
+        if case.output_file:
+            names.add(str(case.output_file).casefold())
+    return names
+
+
+def _package_draft_from_archive(entries):
+    metadata = {}
+    metadata_file = next((name for name in entries if name.casefold() == 'problem.json'), '')
+    if metadata_file:
+        try:
+            value = json.loads(entries[metadata_file].decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError('problem.json must contain valid UTF-8 JSON.')
+        if not isinstance(value, dict):
+            raise ValueError('problem.json must be an object.')
+        metadata = value
+    statement_file = next((name for name in entries if name.casefold() in {'statement.md', 'statement.markdown'}), '')
+    pairs = _testcase_file_pairs(list(entries))
+    tests = [
+        {
+            'input': _archive_entry_text(entries, input_name, limit=CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES),
+            'output': _archive_entry_text(entries, output_name, limit=CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES),
+            'isSample': index == 1,
+        }
+        for index, (input_name, output_name) in enumerate(pairs, start=1)
+    ]
+    draft = {
+        'externalId': metadata.get('externalId', metadata.get('external_id', metadata.get('code', ''))),
+        'title': metadata.get('title', metadata.get('name', '')),
+        'description': _archive_entry_text(entries, statement_file, limit=CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES)
+        if statement_file else metadata.get('description', metadata.get('statement', '')),
+        'difficulty': metadata.get('difficulty', 'Easy'),
+        'rating': metadata.get('rating', 1),
+        'timeLimit': metadata.get('timeLimit', metadata.get('time_limit', 1000)),
+        'memoryLimit': metadata.get('memoryLimit', metadata.get('memory_limit', 256)),
+        'visibility': metadata.get('visibility', 'private'),
+        'scoringMode': metadata.get('scoringMode', metadata.get('scoring_mode', 'full')),
+        'allowedLanguages': metadata.get('allowedLanguages', metadata.get('allowed_languages', [])),
+        'editorial': metadata.get('editorial', ''),
+        'checkerCode': metadata.get('checkerCode', metadata.get('checker_code', '')),
+        'referenceSolutionCode': metadata.get('referenceSolutionCode', metadata.get('reference_solution_code', '')),
+        'referenceSolutionLanguage': metadata.get('referenceSolutionLanguage', metadata.get('reference_solution_language', 'cpp20')),
+        'problemType': metadata.get('problemType', metadata.get('problem_type', 'standard')),
+        'ioMode': metadata.get('ioMode', metadata.get('io_mode', 'standard')),
+        'inputFileName': metadata.get('inputFileName', metadata.get('input_file_name', '')),
+        'outputFileName': metadata.get('outputFileName', metadata.get('output_file_name', '')),
+        'testCases': tests,
+    }
+    return {
+        'draft': draft,
+        'summary': {
+            'testCases': {
+                'submittedCount': len(tests),
+                'savedCount': len(tests),
+                'sampleCount': sum(1 for row in tests if row['isSample']),
+                'duplicatesSkipped': 0,
+            },
+        },
+    }
+
+
+@csrf_protect
+@require_http_methods(['POST'])
+def cppro_problem_package_inspect(request):
+    denied = _require_platform_admin(request)
+    if denied:
+        return denied
+    uploaded = request.FILES.get('file') or request.FILES.get('zipfile')
+    if uploaded is None:
+        return _json_error('A ZIP problem package is required.', 400)
+    try:
+        entries = _read_problem_archive_entries(uploaded)
+        return JsonResponse(_package_draft_from_archive(entries), json_dumps_params={'ensure_ascii': False})
+    except ValueError as error:
+        return _json_error(str(error), 400)
+
+
+@csrf_protect
+@require_http_methods(['POST'])
+def cppro_problem_testcase_import(request, identifier):
+    problem, error = _admin_problem_from_identifier(request, identifier)
+    if error:
+        return error
+    uploaded = request.FILES.get('file') or request.FILES.get('zipfile')
+    if uploaded is None:
+        return _json_error('A testcase ZIP is required.', 400)
+    mode = 'replace' if str(request.GET.get('mode') or request.POST.get('mode') or '').lower() == 'replace' else 'append'
+    try:
+        incoming_entries = _read_problem_archive_entries(uploaded)
+        incoming_test_files = list(incoming_entries)
+        incoming_pairs = _testcase_file_pairs(incoming_test_files)
+        if not incoming_pairs:
+            return _json_error('No matching input/output testcase pairs were found in the ZIP archive.', 400)
+        with transaction.atomic():
+            data, _ = ProblemData.objects.get_or_create(problem=problem)
+            existing_entries = _problem_data_archive_entries(data)
+            existing_test_files = _problem_case_file_names(problem)
+            duplicates_skipped = 0
+            if mode == 'replace':
+                entries = {
+                    name: content
+                    for name, content in existing_entries.items()
+                    if name.casefold() not in existing_test_files
+                }
+                entries.update(incoming_entries)
+                testcase_files = list(incoming_entries)
+            else:
+                entries = dict(existing_entries)
+                existing_by_key = {name.casefold(): (name, content) for name, content in existing_entries.items()}
+                has_conflict = any(
+                    name.casefold() in existing_by_key and existing_by_key[name.casefold()][1] != content
+                    for name, content in incoming_entries.items()
+                )
+                if has_conflict:
+                    prefix = 'imports/%s/' % uuid.uuid4().hex[:12]
+                    incoming_entries = {prefix + name: content for name, content in incoming_entries.items()}
+                for name, content in incoming_entries.items():
+                    existing = existing_by_key.get(name.casefold())
+                    if existing and existing[1] == content:
+                        duplicates_skipped += 1
+                        continue
+                    entries[name] = content
+                testcase_files = [
+                    name for name in entries
+                    if name.casefold() in existing_test_files or name in incoming_entries
+                ]
+            rows = _auto_testcase_rows(problem, testcase_files)
+            if not rows:
+                return _json_error('No matching input/output testcase pairs were found in the ZIP archive.', 400)
+            _save_problem_archive(problem, data, entries)
+            _replace_admin_testcases(problem, data, rows, list(entries))
+            feedback = _compile_problem_data(problem, data, list(entries))
+            if feedback:
+                return _json_error(feedback, 400)
+        return JsonResponse({
+            'ok': True,
+            'mode': mode,
+            'importedCount': len(incoming_pairs),
+            'totalCount': sum(1 for row in rows if row.get('type') == 'C'),
+            'duplicatesSkipped': duplicates_skipped,
+        }, json_dumps_params={'ensure_ascii': False})
+    except ValueError as error:
+        return _json_error(str(error), 400)
+
+
+@require_GET
+def cppro_problem_package_download(request, identifier):
+    problem, error = _admin_problem_from_identifier(request, identifier)
+    if error:
+        return error
+    try:
+        data = problem.data_files
+    except ProblemData.DoesNotExist:
+        data = None
+    entries = _problem_data_archive_entries(data)
+    metadata = {
+        'externalId': problem.code,
+        'title': problem.name,
+        'description': problem.description or '',
+        'timeLimit': int(float(problem.time_limit or 1) * 1000),
+        'memoryLimit': max(1, int(round(float(problem.memory_limit or 0) / 1024))),
+        'visibility': 'public' if problem.is_public else 'private',
+        'scoringMode': 'partial' if problem.partial else 'full',
+        'allowedLanguages': list(problem.allowed_languages.order_by('key').values_list('key', flat=True)),
+    }
+    archive_buffer = BytesIO()
+    with ZipFile(archive_buffer, 'w', compression=ZIP_DEFLATED) as archive:
+        archive.writestr('problem.json', json.dumps(metadata, ensure_ascii=False, indent=2))
+        archive.writestr('statement.md', problem.description or '')
+        for name in sorted(entries, key=_natural_file_key):
+            if name.casefold() in {'problem.json', 'statement.md', 'statement.markdown'}:
+                continue
+            archive.writestr(name, entries[name])
+    filename = re.sub(r'[^A-Za-z0-9._-]+', '-', problem.code or 'problem').strip('-') or 'problem'
+    response = HttpResponse(archive_buffer.getvalue(), content_type='application/zip')
+    response['Content-Disposition'] = 'attachment; filename="%s-package.zip"' % filename
+    response['Cache-Control'] = 'no-store'
+    return response
 
 
 def _management_problem_row(problem):
@@ -4154,6 +4553,51 @@ def _create_management_quiz(request, payload):
 
 
 @csrf_protect
+@require_http_methods(['GET', 'POST', 'DELETE'])
+def cppro_badge_assignments(request, identifier, user_identifier=None):
+    denied = _require_platform_admin(request)
+    if denied:
+        return denied
+    Badge = apps.get_model('judge', 'Badge')
+    badge = Badge.objects.filter(id=int(identifier)).first() if str(identifier).isdigit() else None
+    if badge is None:
+        return _json_error('Badge not found.', 404)
+
+    def assignment_row(profile):
+        user = profile.user
+        return {
+            'badge_id': badge.id,
+            'user_id': profile.id,
+            'username': user.username,
+            'full_name': user.get_full_name() or profile.username_display_override or user.username,
+            'avatar_url': _profile_avatar(profile),
+        }
+
+    if request.method == 'GET':
+        profiles = Profile.objects.select_related('user').filter(badges=badge).order_by('user__username')
+        rows = [assignment_row(profile) for profile in profiles]
+        return JsonResponse({'rows': rows, 'total': len(rows)}, json_dumps_params={'ensure_ascii': False})
+
+    if request.method == 'POST':
+        payload = _admin_payload(request)
+        raw_user_id = payload.get('userId', payload.get('user_id'))
+    else:
+        raw_user_id = user_identifier
+    if not str(raw_user_id or '').isdigit():
+        return _json_error('A valid user id is required.', 400)
+    profile = Profile.objects.select_related('user').filter(id=int(raw_user_id)).first()
+    if profile is None:
+        profile = Profile.objects.select_related('user').filter(user_id=int(raw_user_id)).first()
+    if profile is None:
+        return _json_error('User not found.', 404)
+    if request.method == 'POST':
+        profile.badges.add(badge)
+        return JsonResponse(assignment_row(profile), status=201, json_dumps_params={'ensure_ascii': False})
+    profile.badges.remove(badge)
+    return JsonResponse({'ok': True})
+
+
+@csrf_protect
 @require_http_methods(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 def cppro_admin_management(request, section, identifier=None):
     denied = _require_platform_admin(request)
@@ -4211,6 +4655,10 @@ def cppro_admin_management(request, section, identifier=None):
                     raise ValueError('Badge name is required.')
                 badge = Badge.objects.create(name=name[:50], mini=str(payload.get('iconUrl') or 'badge')[:150], full_size=str(payload.get('fullSize') or payload.get('iconUrl') or 'badge')[:150])
                 return JsonResponse(_management_badge_row(badge), status=201, json_dumps_params={'ensure_ascii': False})
+            if request.method == 'DELETE' and identifier in (None, ''):
+                deleted = Badge.objects.count()
+                Badge.objects.all().delete()
+                return JsonResponse({'ok': True, 'deleted': deleted})
             badge = Badge.objects.filter(id=int(identifier)).first() if str(identifier).isdigit() else None
             if not badge:
                 return _json_error('Badge not found.', 404)
