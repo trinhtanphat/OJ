@@ -800,5 +800,19 @@ try:
 except IOError:
     pass
 
+# A bridged daemon can belong to more than one Docker network. Its listening
+# sockets must therefore bind all interfaces, while Django still connects via
+# the service hostname on its own network. These environment overrides run
+# after local_settings.py so legacy production settings stay compatible.
+_bridged_bind_host = os.environ.get('BRIDGED_BIND_HOST', '').strip()
+_bridged_connect_host = os.environ.get('BRIDGED_CONNECT_HOST', '').strip()
+if _bridged_bind_host:
+    _bridged_secure_port = int(os.environ.get('BRIDGED_SECURE_PORT', '9999'))
+    _bridged_port = int(os.environ.get('BRIDGED_PORT', '9998'))
+    BRIDGED_JUDGE_ADDRESS = [(_bridged_bind_host, _bridged_secure_port)]
+    BRIDGED_DJANGO_ADDRESS = [(_bridged_bind_host, _bridged_port)]
+if _bridged_connect_host:
+    BRIDGED_DJANGO_CONNECT = (_bridged_connect_host, int(os.environ.get('BRIDGED_PORT', '9998')))
+
 if not DEBUG and SECRET_KEY == _DEVELOPMENT_SECRET_KEY:
     raise RuntimeError('Set DJANGO_SECRET_KEY when DEBUG is disabled.')

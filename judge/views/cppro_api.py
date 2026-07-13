@@ -18,7 +18,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.mail.backends.smtp import EmailBackend
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Max, Prefetch, Q, Sum
+from django.db.models import Avg, Count, F, Max, Min, Prefetch, Q, Sum
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
@@ -27,8 +27,11 @@ from django.utils.dateparse import parse_datetime
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods
+from reversion import revisions
+from reversion.models import Revision, Version
 
-from judge.models import BlogPost, Contest, ContestAnnouncement, ContestParticipation, Language, MiscConfig, Organization, OrganizationRequest, Problem, Profile, Submission, SubmissionSource
+from judge.dblock import LockModel
+from judge.models import BlogPost, Comment, CommentLock, Contest, ContestAnnouncement, ContestParticipation, Language, MiscConfig, Organization, OrganizationRequest, Problem, Profile, Submission, SubmissionSource
 from judge.models.contest import ContestProblem, ContestSubmission
 from judge.models.problem import ProblemGroup, ProblemType
 from judge.models.problem_data import CHECKERS, GRADERS, ProblemData, ProblemTestCase
@@ -50,6 +53,8 @@ CPPRO_SUBMISSION_VERIFICATION_TTL_SECONDS = 5 * 60
 CPPRO_TESTCASE_ARCHIVE_MAX_FILES = 500
 CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES = 4 * 1024 * 1024
 CPPRO_TESTCASE_ARCHIVE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+CPPRO_PROBLEM_COMMENT_REACTIONS_KEY = 'cppro_problem_comment_rx'
+CPPRO_PROBLEM_COMMENT_REACTIONS = frozenset({'like', 'love', 'celebrate', 'insightful'})
 
 
 def _cppro_post_registry():
@@ -1170,6 +1175,337 @@ def _read_json_body(request):
         return json.loads(request.body.decode('utf-8') or '{}')
     except (TypeError, ValueError, UnicodeDecodeError):
         return None
+
+
+def _cppro_visible_problem(request, identifier):
+    """Resolve a problem through the same visibility boundary as CPPro reads."""
+    query = Problem.objects.all() if _is_platform_admin(request.user) else Problem.get_visible_problems(request.user)
+    if str(identifier).isdigit():
+        problem = query.filter(pk=int(identifier)).first()
+        if problem is not None:
+            return problem
+    return query.filter(code=str(identifier)).first()
+
+
+def _cppro_submission_statistics(query):
+    """Return the chart buckets consumed by the CPPro problem page in milliseconds."""
+    total = query.count()
+    partial = query.filter(result='AC', case_total__gt=0, case_points__lt=F('case_total')).count()
+    accepted = max(0, query.filter(result='AC').count() - partial)
+    pending_codes = Submission.IN_PROGRESS_GRADING_STATUS
+    pending = query.filter(
+        Q(result__isnull=True, status__in=pending_codes) | Q(result__in=pending_codes),
+    ).count()
+    runtime = query.filter(
+        Q(result__in=('RTE', 'MLE', 'OLE', 'IR', 'IE'))
+        | Q(result__isnull=True, status__in=('RTE', 'MLE', 'OLE', 'IR', 'IE')),
+    ).count()
+    time_limit = query.filter(
+        Q(result='TLE') | Q(result__isnull=True, status='TLE'),
+    ).count()
+    timing = query.exclude(time__isnull=True).aggregate(avg_runtime=Avg('time'))
+    fastest = query.filter(result='AC').exclude(time__isnull=True).aggregate(fastest=Min('time'))
+
+    def milliseconds(value):
+        try:
+            return round(float(value) * 1000, 3)
+        except (TypeError, ValueError):
+            return None
+
+    wrong = max(0, total - accepted - partial - pending - runtime - time_limit)
+    return {
+        'total': total,
+        'accepted': accepted,
+        'partial': partial,
+        'pending': pending,
+        'runtime_error': runtime,
+        'time_limit': time_limit,
+        'wrong_answer': wrong,
+        # Alias names are retained for CPPro clients that were built before
+        # the normalized snake_case bridge response.
+        're': runtime,
+        'tle': time_limit,
+        'wrong': wrong,
+        'avg_runtime': milliseconds(timing.get('avg_runtime')),
+        'fastest_ac_runtime': milliseconds(fastest.get('fastest')),
+    }
+
+
+@require_GET
+def cppro_problem_submissions(request, identifier):
+    """List visible submissions and aggregate statistics for one visible problem."""
+    problem = _cppro_visible_problem(request, identifier)
+    if problem is None:
+        return _json_error('Problem not found.', 404)
+
+    query = (
+        _visible_submission_queryset(request.user)
+        .filter(problem_id=problem.id)
+        .select_related('problem', 'language', 'user__user', 'contest_object')
+    )
+    profile = _current_profile(request)
+    if str(request.GET.get('scope') or '').lower() == 'mine':
+        query = query.filter(user=profile) if profile else query.none()
+    username = str(request.GET.get('username') or '').strip()
+    if username:
+        query = query.filter(user__user__username__iexact=username)
+    verdict = str(request.GET.get('verdict') or '').strip().upper()
+    if verdict and verdict != 'ALL':
+        query = query.filter(Q(result__iexact=verdict) | Q(status__iexact=verdict))
+
+    try:
+        page = max(1, int(request.GET.get('page') or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        limit = max(1, min(100, int(request.GET.get('limit') or 20)))
+    except (TypeError, ValueError):
+        limit = 20
+    sort_map = {
+        'id': 'id',
+        'user': 'user__user__username',
+        'language': 'language__name',
+        'score': 'points',
+        'runtime': 'time',
+        'memory': 'memory',
+        'created': 'date',
+    }
+    sort_key = sort_map.get(str(request.GET.get('sort') or 'created').lower(), 'date')
+    if str(request.GET.get('dir') or 'desc').lower() == 'desc':
+        sort_key = '-' + sort_key
+    total = query.count()
+    start = (page - 1) * limit
+    rows = list(query.order_by(sort_key, '-id')[start:start + limit])
+    return JsonResponse({
+        'generatedAt': timezone.now().isoformat(),
+        'rows': [_submission_row(submission) for submission in rows],
+        'total': total,
+        'page': page,
+        'limit': limit,
+        'summary': _cppro_submission_statistics(query),
+    }, json_dumps_params={'ensure_ascii': False})
+
+
+def _cppro_problem_comment_reactions(config_row=None):
+    """Load the one-reaction-per-profile state without exposing profile IDs."""
+    if config_row is None:
+        config = _cppro_config_value(CPPRO_PROBLEM_COMMENT_REACTIONS_KEY)
+    else:
+        try:
+            config = json.loads(config_row.value) if config_row.value else {}
+        except (TypeError, ValueError):
+            config = {}
+    raw = config.get('comments') if isinstance(config, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    rows = {}
+    for comment_id, members in raw.items():
+        if not str(comment_id).isdigit() or not isinstance(members, dict):
+            continue
+        clean_members = {}
+        for profile_id, reaction in members.items():
+            if str(profile_id).isdigit() and int(profile_id) > 0 and reaction in CPPRO_PROBLEM_COMMENT_REACTIONS:
+                clean_members[str(int(profile_id))] = reaction
+        if clean_members:
+            rows[str(int(comment_id))] = clean_members
+    return rows
+
+
+def _save_cppro_problem_comment_reactions(rows, config_row=None):
+    # The state is deliberately bounded: old/deleted comments do not make a
+    # global MiscConfig record grow forever, and Comment IDs increase over time.
+    comment_ids = sorted(
+        (int(comment_id) for comment_id, members in rows.items() if str(comment_id).isdigit() and members),
+    )[-5000:]
+    compact = {}
+    for comment_id in comment_ids:
+        members = rows.get(str(comment_id), {})
+        if not isinstance(members, dict):
+            continue
+        clean_members = {
+            str(int(profile_id)): reaction
+            for profile_id, reaction in members.items()
+            if str(profile_id).isdigit() and int(profile_id) > 0 and reaction in CPPRO_PROBLEM_COMMENT_REACTIONS
+        }
+        if clean_members:
+            compact[str(comment_id)] = clean_members
+    encoded = json.dumps({'comments': compact}, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+    if config_row is None:
+        MiscConfig.objects.create(key=CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, value=encoded)
+    else:
+        config_row.value = encoded
+        config_row.save(update_fields=['value'])
+
+
+def _update_cppro_problem_comment_reaction(comment_id, profile_id, reaction):
+    # MiscConfig.key is indexed but not unique, so a row lock cannot protect
+    # the first concurrent insert. Keep the read-modify-write cycle under the
+    # native DMOJ table lock and consistently update the newest legacy row.
+    with LockModel(write=(MiscConfig,)):
+        config_row = (
+            MiscConfig.objects
+            .filter(key=CPPRO_PROBLEM_COMMENT_REACTIONS_KEY)
+            .order_by('-id')
+            .first()
+        )
+        reaction_rows = _cppro_problem_comment_reactions(config_row) if config_row else {}
+        members = reaction_rows.setdefault(str(comment_id), {})
+        if reaction is None:
+            members.pop(str(profile_id), None)
+            if not members:
+                reaction_rows.pop(str(comment_id), None)
+        else:
+            members[str(profile_id)] = reaction
+        _save_cppro_problem_comment_reactions(reaction_rows, config_row)
+    return reaction_rows
+
+
+def _cppro_problem_comment_row(comment, profile, reaction_rows=None):
+    members = (reaction_rows or {}).get(str(comment.id), {})
+    reactions = {}
+    for reaction in members.values():
+        reactions[reaction] = reactions.get(reaction, 0) + 1
+    author = comment.author
+    return {
+        'id': comment.id,
+        'parent_id': comment.parent_id,
+        'username': author.user.username,
+        'author_username': author.user.username,
+        'full_name': _author_name(author),
+        'author_full_name': _author_name(author),
+        'avatar_url': _profile_avatar(author) or None,
+        'author_avatar_url': _profile_avatar(author) or None,
+        'body': comment.body,
+        'is_deleted': False,
+        'reactions': reactions,
+        'reaction_count': sum(reactions.values()),
+        'my_reaction': members.get(str(profile.id)) if profile else None,
+        'created_at': comment.time.isoformat() if comment.time else '',
+    }
+
+
+def _cppro_comment_interaction_error(profile):
+    if profile.mute:
+        suffix = '' if profile.ban_reason is None else ' Reason: ' + profile.ban_reason
+        return 'This account cannot interact with comments.' + suffix
+    if profile.is_new_user:
+        return 'Solve at least %d problems before interacting with comments.' % settings.VNOJ_INTERACT_MIN_PROBLEM_COUNT
+    return None
+
+
+def _cppro_problem_comment_lock_reason(request_user, problem, profile):
+    # Match ProblemDetail.is_comment_locked(): contestants must use the native
+    # clarification channel when their current contest enables it.
+    if profile is not None and profile.current_contest_id:
+        participation = profile.current_contest
+        if (
+            participation.contest.use_clarifications
+            and problem.contests.filter(contest_id=participation.contest_id).exists()
+        ):
+            return 'Comments are disabled while this contest uses clarifications.'
+    if CommentLock.objects.filter(page='p:%s' % problem.code).exists() and not request_user.has_perm(
+        'judge.override_comment_lock',
+    ):
+        return 'Comments are locked for this problem.'
+    return None
+
+
+@csrf_protect
+@require_http_methods(['GET', 'POST', 'PUT'])
+def cppro_problem_comments(request, identifier, comment_id=None, action=None):
+    """Native DMOJ problem comments with CPPro reaction presentation data."""
+    problem = _cppro_visible_problem(request, identifier)
+    if problem is None:
+        return _json_error('Problem not found.', 404)
+    page = 'p:%s' % problem.code
+    profile = _current_profile(request) if request.user.is_authenticated else None
+
+    if request.method == 'GET':
+        if comment_id is not None:
+            return _json_error('Unknown comment action.', 404)
+        try:
+            limit = max(1, min(500, int(request.GET.get('limit') or 200)))
+        except (TypeError, ValueError):
+            limit = 200
+        query = (
+            Comment.objects
+            .filter(page=page, hidden=False)
+            .select_related('author__user')
+            .order_by('tree_id', 'lft', 'id')
+        )
+        total = query.count()
+        reaction_rows = _cppro_problem_comment_reactions()
+        return JsonResponse({
+            'rows': [_cppro_problem_comment_row(comment, profile, reaction_rows) for comment in query[:limit]],
+            'total': total,
+            'limit': limit,
+        }, json_dumps_params={'ensure_ascii': False})
+
+    if not request.user.is_authenticated:
+        return _json_error('Authentication required.', 401)
+    if comment_id is None and request.method == 'POST':
+        lock_reason = _cppro_problem_comment_lock_reason(request.user, problem, profile)
+        if lock_reason:
+            return _json_error(lock_reason, 403)
+    interaction_error = _cppro_comment_interaction_error(profile)
+    if interaction_error:
+        return _json_error(interaction_error, 403)
+    payload = _read_json_body(request)
+    if not isinstance(payload, dict):
+        return _json_error('Invalid JSON body.', 400)
+
+    if comment_id is None:
+        if request.method != 'POST':
+            return _json_error('Method not allowed for comments.', 405)
+        body = str(payload.get('body') or '').strip()
+        if not body:
+            return _json_error('Comment body is required.', 400)
+        if len(body) > 8192:
+            return _json_error('Comment body may contain at most 8192 characters.', 400)
+        raw_parent = payload.get('parentId', payload.get('parent_id'))
+        parent = None
+        if raw_parent not in (None, '', 0, '0'):
+            try:
+                parent_id = int(raw_parent)
+            except (TypeError, ValueError):
+                return _json_error('Parent comment is invalid.', 400)
+            parent = Comment.objects.filter(pk=parent_id, page=page, hidden=False).first()
+            if parent is None:
+                return _json_error('Parent comment not found.', 404)
+            reply_cutoff = timezone.now() - settings.DMOJ_COMMENT_REPLY_TIMEFRAME
+            if parent.time <= reply_cutoff and not request.user.has_perm('judge.change_comment'):
+                return _json_error('This comment is no longer open for replies.', 403)
+        comment = Comment(author=profile, page=page, body=body, parent=parent)
+        with LockModel(write=(Comment, Revision, Version), read=(ContentType,)), revisions.create_revision():
+            revisions.set_user(request.user)
+            revisions.set_comment('Posted comment through CPPro API')
+            comment.save()
+        reaction_rows = _cppro_problem_comment_reactions()
+        return JsonResponse(
+            _cppro_problem_comment_row(comment, profile, reaction_rows),
+            status=201,
+            json_dumps_params={'ensure_ascii': False},
+        )
+
+    if str(action or '').strip().lower() != 'reaction':
+        return _json_error('Unknown comment action.', 404)
+    if request.method not in {'POST', 'PUT'}:
+        return _json_error('Method not allowed for reactions.', 405)
+    try:
+        comment_id = int(comment_id)
+    except (TypeError, ValueError):
+        return _json_error('Comment not found.', 404)
+    comment = Comment.objects.filter(pk=comment_id, page=page, hidden=False).select_related('author__user').first()
+    if comment is None:
+        return _json_error('Comment not found.', 404)
+    reaction = str(payload.get('reaction') or '').strip().lower() or None
+    if reaction is not None and reaction not in CPPRO_PROBLEM_COMMENT_REACTIONS:
+        return _json_error('Unknown reaction.', 400)
+    reaction_rows = _update_cppro_problem_comment_reaction(comment.id, profile.id, reaction)
+    return JsonResponse(
+        _cppro_problem_comment_row(comment, profile, reaction_rows),
+        json_dumps_params={'ensure_ascii': False},
+    )
 
 
 def _logout_cookie_response():
@@ -3409,6 +3745,15 @@ def _problem_testcase_material_rows(problem):
     ]
 
 
+def _problem_testcase_preview_rows(problem):
+    """Return only safe, lightweight testcase metadata for management tables."""
+    return [
+        _admin_testcase_row(case)
+        for case in problem.cases.order_by('order', 'id')
+        if case.type == 'C'
+    ]
+
+
 def _admin_ticket_row(ticket):
     return {
         'id': ticket.id,
@@ -3910,6 +4255,9 @@ def cppro_problem_testcase_import(request, identifier):
             'importedCount': len(incoming_pairs),
             'totalCount': sum(1 for row in rows if row.get('type') == 'C'),
             'duplicatesSkipped': duplicates_skipped,
+            # Let the SPA draw a testcase table immediately without a second
+            # request that extracts every input/output file from a large ZIP.
+            'testcases': _problem_testcase_preview_rows(problem),
         }, json_dumps_params={'ensure_ascii': False})
     except ValueError as error:
         return _json_error(str(error), 400)

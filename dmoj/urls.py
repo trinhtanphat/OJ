@@ -127,6 +127,12 @@ urlpatterns = [
     path('api/cppro/problems/package/inspect', cppro_api.cppro_problem_package_inspect),
     path('api/cppro/problems/<str:identifier>/package.zip', cppro_api.cppro_problem_package_download),
     path('api/cppro/problems/<str:identifier>/testcases/import', cppro_api.cppro_problem_testcase_import),
+    path('api/cppro/problems/<str:identifier>/submissions', cppro_api.cppro_problem_submissions),
+    path(
+        'api/cppro/problems/<str:identifier>/comments/<str:comment_id>/<str:action>',
+        cppro_api.cppro_problem_comments,
+    ),
+    path('api/cppro/problems/<str:identifier>/comments', cppro_api.cppro_problem_comments),
     path(
         'api/cppro/problems/<str:identifier>/testcases',
         cppro_api.cppro_problem_admin,

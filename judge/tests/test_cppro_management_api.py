@@ -6,9 +6,10 @@ from django.apps import apps
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
-from judge.models import Language, Submission, SubmissionTestCase
-from judge.models.tests.util import CommonDataMixin, create_problem
-from judge.views.cppro_api import CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY
+from judge.models import Comment, CommentLock, Language, MiscConfig, Submission, SubmissionTestCase
+from judge.models.tests.util import CommonDataMixin, create_contest, create_contest_participation, \
+    create_contest_problem, create_problem
+from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY
 
 
 def testcase_zip(**files):
@@ -43,6 +44,11 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
         self.assertEqual(imported.status_code, 200)
         self.assertEqual(imported.json()['importedCount'], 2)
         self.assertEqual(imported.json()['totalCount'], 2)
+        self.assertEqual(len(imported.json()['testcases']), 2)
+        self.assertEqual(imported.json()['testcases'][0]['input_file'], 'tests/01.in')
+        self.assertEqual(imported.json()['testcases'][0]['output_file'], 'tests/01.out')
+        self.assertNotIn('input', imported.json()['testcases'][0])
+        self.assertNotIn('output', imported.json()['testcases'][0])
 
         details = self.client.get('/api/cppro/problems/%d/testcases' % self.problem.id)
         self.assertEqual(details.status_code, 200)
@@ -153,3 +159,154 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
         self.assertGreaterEqual(cleared.json()['deleted'], 2)
         self.assertFalse(Badge.objects.exists())
         self.assertFalse(self.member.profile.badges.exists())
+
+    def test_problem_submission_stats_route_exists_and_uses_visible_submissions(self):
+        # DMOJ scales testcase points to the problem's configured points. A
+        # fully accepted submission can therefore have points < case_total.
+        self.problem.points = 25
+        self.problem.save(update_fields=['points'])
+        Submission.objects.create(
+            user=self.member.profile,
+            problem=self.problem,
+            language=Language.get_python3(),
+            status='D',
+            result='AC',
+            points=25,
+            case_points=100,
+            case_total=100,
+            time=0.012,
+        )
+        Submission.objects.create(
+            user=self.staff.profile,
+            problem=self.problem,
+            language=Language.get_python3(),
+            status='D',
+            result='WA',
+            points=0,
+            case_points=0,
+            case_total=100,
+            time=0.024,
+        )
+
+        response = self.client.get(
+            '/api/cppro/problems/%d/submissions?limit=1&withCount=true' % self.problem.id,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['total'], 2)
+        self.assertEqual(len(payload['rows']), 1)
+        self.assertEqual(payload['summary']['accepted'], 1)
+        self.assertEqual(payload['summary']['partial'], 0)
+        self.assertEqual(payload['summary']['wrong_answer'], 1)
+        self.assertEqual(payload['summary']['avg_runtime'], 18)
+        self.assertEqual(payload['summary']['fastest_ac_runtime'], 12)
+
+        private_problem = create_problem(code='cppro_private_stats', is_public=False)
+        self.assertEqual(
+            self.client.get('/api/cppro/problems/%d/submissions' % private_problem.id).status_code,
+            404,
+        )
+
+    def test_problem_comment_routes_use_native_visibility_locks_and_reactions(self):
+        public_comments = self.client.get('/api/cppro/problems/%s/comments' % self.problem.code)
+        self.assertEqual(public_comments.status_code, 200)
+        self.assertEqual(public_comments.json()['rows'], [])
+
+        self.client.force_login(self.member)
+        new_user = self.client.post(
+            '/api/cppro/problems/%s/comments' % self.problem.code,
+            data=json.dumps({'body': 'First comment'}),
+            content_type='application/json',
+        )
+        self.assertEqual(new_user.status_code, 403)
+
+        self.client.force_login(self.staff)
+        created = self.client.post(
+            '/api/cppro/problems/%s/comments' % self.problem.code,
+            data=json.dumps({'body': 'A native DMOJ problem comment'}),
+            content_type='application/json',
+        )
+        self.assertEqual(created.status_code, 201)
+        comment = created.json()
+        self.assertEqual(comment['author_username'], self.staff.username)
+        self.assertEqual(comment['body'], 'A native DMOJ problem comment')
+
+        self.client.force_login(self.users['superuser'])
+        reacted = self.client.put(
+            '/api/cppro/problems/%s/comments/%s/reaction' % (self.problem.code, comment['id']),
+            data=json.dumps({'reaction': 'love'}),
+            content_type='application/json',
+        )
+        self.assertEqual(reacted.status_code, 200)
+        self.assertEqual(reacted.json()['reactions'], {'love': 1})
+        self.assertEqual(reacted.json()['my_reaction'], 'love')
+
+        self.client.force_login(self.staff)
+        CommentLock.objects.create(page='p:%s' % self.problem.code)
+        locked = self.client.post(
+            '/api/cppro/problems/%s/comments' % self.problem.code,
+            data=json.dumps({'body': 'This must be rejected'}),
+            content_type='application/json',
+        )
+        self.assertEqual(locked.status_code, 403)
+
+        private_problem = create_problem(code='cppro_private_comments', is_public=False)
+        self.client.logout()
+        self.assertEqual(
+            self.client.get('/api/cppro/problems/%s/comments' % private_problem.code).status_code,
+            404,
+        )
+
+    def test_problem_comments_are_disabled_during_native_clarification_contest(self):
+        contest = create_contest(key='cppro_comment_clarifications', use_clarifications=True)
+        create_contest_problem(contest=contest, problem=self.problem)
+        participation = create_contest_participation(contest=contest, user=self.staff.profile)
+        self.staff.profile.current_contest = participation
+        self.staff.profile.save(update_fields=['current_contest'])
+        self.client.force_login(self.staff)
+
+        response = self.client.post(
+            '/api/cppro/problems/%s/comments' % self.problem.code,
+            data=json.dumps({'body': 'This must use a clarification instead'}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn('clarifications', response.json()['message'])
+        self.assertFalse(Comment.objects.filter(body='This must use a clarification instead').exists())
+
+    def test_problem_comment_reactions_update_the_locked_latest_config_row(self):
+        comment = Comment.objects.create(
+            author=self.staff.profile,
+            page='p:%s' % self.problem.code,
+            body='Reaction locking test',
+        )
+        older = MiscConfig.objects.create(
+            key=CPPRO_PROBLEM_COMMENT_REACTIONS_KEY,
+            value=json.dumps({'comments': {}}),
+        )
+        latest = MiscConfig.objects.create(
+            key=CPPRO_PROBLEM_COMMENT_REACTIONS_KEY,
+            value=json.dumps({
+                'comments': {
+                    str(comment.id): {str(self.users['superuser'].profile.id): 'love'},
+                },
+            }),
+        )
+        reactor = self.users['staff_problem_edit_own']
+        self.client.force_login(reactor)
+
+        response = self.client.put(
+            '/api/cppro/problems/%s/comments/%s/reaction' % (self.problem.code, comment.id),
+            data=json.dumps({'reaction': 'like'}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['reactions'], {'love': 1, 'like': 1})
+        older.refresh_from_db()
+        latest.refresh_from_db()
+        latest_members = json.loads(latest.value)['comments'][str(comment.id)]
+        self.assertEqual(latest_members[str(reactor.profile.id)], 'like')
+        self.assertEqual(json.loads(older.value), {'comments': {}})
