@@ -8,12 +8,12 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import TestCase
 
-from judge.models import Comment, CommentLock, Language, MiscConfig, Submission, SubmissionTestCase
+from judge.models import Comment, CommentLock, Language, MiscConfig, Profile, Submission, SubmissionTestCase
 from judge.models.tests.util import CommonDataMixin, create_contest, create_contest_participation, \
     create_contest_problem, create_problem
 from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_CREATE_LOCK, CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, \
     CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, \
-    _update_cppro_problem_comment_reaction
+    _cppro_problem_comment_lock_reason, _update_cppro_problem_comment_reaction
 
 
 def testcase_zip(**files):
@@ -263,11 +263,32 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
         )
 
     def test_problem_comments_are_disabled_during_native_clarification_contest(self):
-        contest = create_contest(key='cppro_comment_clarifications', use_clarifications=True)
-        create_contest_problem(contest=contest, problem=self.problem)
+        contest = create_contest(
+            key='cppro_comment_clarifications',
+            is_visible=True,
+            use_clarifications=True,
+        )
+        contest_problem = create_contest_problem(contest=contest, problem=self.problem)
+        profile_id = self.staff.profile.id
         participation = create_contest_participation(contest=contest, user=self.staff.profile)
-        self.staff.profile.current_contest = participation
-        self.staff.profile.save(update_fields=['current_contest'])
+        Profile.objects.filter(pk=profile_id).update(current_contest=participation)
+        self.staff.refresh_from_db()
+        profile = Profile.objects.select_related('current_contest__contest').get(pk=profile_id)
+        contest.refresh_from_db()
+        contest_problem.refresh_from_db()
+        self.problem.refresh_from_db()
+
+        self.assertTrue(contest.use_clarifications)
+        self.assertTrue(contest.is_accessible_by(self.staff))
+        self.assertEqual(profile.current_contest_id, participation.id)
+        self.assertEqual(
+            self.problem.contests.get(contest_id=contest.id).id,
+            contest_problem.id,
+        )
+        self.assertIn(
+            'clarifications',
+            _cppro_problem_comment_lock_reason(self.staff, self.problem, profile),
+        )
         self.client.force_login(self.staff)
 
         response = self.client.post(
@@ -279,6 +300,8 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn('clarifications', response.json()['message'])
         self.assertFalse(Comment.objects.filter(body='This must use a clarification instead').exists())
+        profile.refresh_from_db()
+        self.assertEqual(profile.current_contest_id, participation.id)
 
     def test_problem_comment_reactions_update_the_locked_latest_config_row(self):
         comment = Comment.objects.create(

@@ -1429,11 +1429,12 @@ def _cppro_problem_comment_lock_reason(request_user, problem, profile):
     # Match ProblemDetail.is_comment_locked(): contestants must use the native
     # clarification channel when their current contest enables it.
     if profile is not None and profile.current_contest_id:
-        participation = profile.current_contest
-        if (
-            participation.contest.use_clarifications
-            and problem.contests.filter(contest_id=participation.contest_id).exists()
-        ):
+        # Import locally to avoid coupling URL-module initialization while
+        # sharing the exact ContestProblem lookup used by ProblemDetail.
+        from judge.views.problem import get_contest_problem
+
+        contest_problem = get_contest_problem(problem, profile)
+        if contest_problem and contest_problem.contest.use_clarifications:
             return 'Comments are disabled while this contest uses clarifications.'
     if CommentLock.objects.filter(page='p:%s' % problem.code).exists() and not request_user.has_perm(
         'judge.override_comment_lock',
