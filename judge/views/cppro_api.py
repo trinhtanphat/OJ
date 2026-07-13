@@ -29,9 +29,7 @@ from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods
 from reversion import revisions
-from reversion.models import Revision, Version
 
-from judge.dblock import LockModel
 from judge.models import BlogPost, Comment, CommentLock, Contest, ContestAnnouncement, ContestParticipation, Language, MiscConfig, Organization, OrganizationRequest, Problem, Profile, Submission, SubmissionSource
 from judge.models.contest import ContestProblem, ContestSubmission
 from judge.models.problem import ProblemGroup, ProblemType
@@ -58,9 +56,11 @@ CPPRO_PROBLEM_COMMENT_REACTIONS_KEY = 'cppro_problem_comment_rx'
 CPPRO_PROBLEM_COMMENT_REACTIONS = frozenset({'like', 'love', 'celebrate', 'insightful'})
 CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK = 'cppro_problem_comment_reactions'
 CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK_TIMEOUT_SECONDS = 5
+CPPRO_PROBLEM_COMMENT_CREATE_LOCK = 'cppro_problem_comment_create'
+CPPRO_PROBLEM_COMMENT_CREATE_LOCK_TIMEOUT_SECONDS = 5
 
 
-class _CpproProblemCommentReactionsBusy(Exception):
+class _CpproMysqlAdvisoryLockBusy(Exception):
     pass
 
 
@@ -1345,31 +1345,34 @@ def _save_cppro_problem_comment_reactions(rows, config_row=None):
 
 
 @contextmanager
-def _cppro_problem_comment_reaction_lock():
+def _cppro_mysql_advisory_lock(lock_name, timeout_seconds):
     acquired = False
     with connection.cursor() as cursor:
         cursor.execute(
             'SELECT GET_LOCK(%s, %s)',
-            [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK_TIMEOUT_SECONDS],
+            [lock_name, timeout_seconds],
         )
         row = cursor.fetchone()
         acquired = bool(row and row[0] == 1)
     if not acquired:
-        raise _CpproProblemCommentReactionsBusy()
+        raise _CpproMysqlAdvisoryLockBusy()
     try:
         yield
     finally:
         # MySQL advisory locks are connection-scoped and do not commit or
         # interfere with Django TestCase/ATOMIC_REQUESTS transactions.
         with connection.cursor() as cursor:
-            cursor.execute('SELECT RELEASE_LOCK(%s)', [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK])
+            cursor.execute('SELECT RELEASE_LOCK(%s)', [lock_name])
             cursor.fetchone()
 
 
 def _update_cppro_problem_comment_reaction(comment_id, profile_id, reaction):
     # MiscConfig.key is not unique, so serialize first insert and later updates
     # with a bounded advisory lock, then consistently mutate the newest row.
-    with _cppro_problem_comment_reaction_lock(), transaction.atomic():
+    with _cppro_mysql_advisory_lock(
+        CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK,
+        CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK_TIMEOUT_SECONDS,
+    ), transaction.atomic():
         config_row = (
             MiscConfig.objects
             .select_for_update()
@@ -1505,10 +1508,16 @@ def cppro_problem_comments(request, identifier, comment_id=None, action=None):
             if parent.time <= reply_cutoff and not request.user.has_perm('judge.change_comment'):
                 return _json_error('This comment is no longer open for replies.', 403)
         comment = Comment(author=profile, page=page, body=body, parent=parent)
-        with LockModel(write=(Comment, Revision, Version), read=(ContentType,)), revisions.create_revision():
-            revisions.set_user(request.user)
-            revisions.set_comment('Posted comment through CPPro API')
-            comment.save()
+        try:
+            with _cppro_mysql_advisory_lock(
+                CPPRO_PROBLEM_COMMENT_CREATE_LOCK,
+                CPPRO_PROBLEM_COMMENT_CREATE_LOCK_TIMEOUT_SECONDS,
+            ), transaction.atomic(), revisions.create_revision():
+                revisions.set_user(request.user)
+                revisions.set_comment('Posted comment through CPPro API')
+                comment.save()
+        except _CpproMysqlAdvisoryLockBusy:
+            return _json_error('Comments are busy. Please try again.', 503)
         reaction_rows = _cppro_problem_comment_reactions()
         return JsonResponse(
             _cppro_problem_comment_row(comment, profile, reaction_rows),
@@ -1532,7 +1541,7 @@ def cppro_problem_comments(request, identifier, comment_id=None, action=None):
         return _json_error('Unknown reaction.', 400)
     try:
         reaction_rows = _update_cppro_problem_comment_reaction(comment.id, profile.id, reaction)
-    except _CpproProblemCommentReactionsBusy:
+    except _CpproMysqlAdvisoryLockBusy:
         return _json_error('Comment reactions are busy. Please try again.', 503)
     return JsonResponse(
         _cppro_problem_comment_row(comment, profile, reaction_rows),

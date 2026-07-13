@@ -11,8 +11,9 @@ from django.test import TestCase
 from judge.models import Comment, CommentLock, Language, MiscConfig, Submission, SubmissionTestCase
 from judge.models.tests.util import CommonDataMixin, create_contest, create_contest_participation, \
     create_contest_problem, create_problem
-from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, \
-    CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, _update_cppro_problem_comment_reaction
+from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_CREATE_LOCK, CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, \
+    CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, \
+    _update_cppro_problem_comment_reaction
 
 
 def testcase_zip(**files):
@@ -325,4 +326,18 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
 
         with connection.cursor() as cursor:
             cursor.execute('SELECT IS_FREE_LOCK(%s)', [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK])
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_problem_comment_create_advisory_lock_is_released_after_save_error(self):
+        self.client.force_login(self.staff)
+        with patch.object(Comment, 'save', side_effect=RuntimeError('forced comment save failure')):
+            with self.assertRaisesRegex(RuntimeError, 'forced comment save failure'):
+                self.client.post(
+                    '/api/cppro/problems/%s/comments' % self.problem.code,
+                    data=json.dumps({'body': 'This save must fail'}),
+                    content_type='application/json',
+                )
+
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT IS_FREE_LOCK(%s)', [CPPRO_PROBLEM_COMMENT_CREATE_LOCK])
             self.assertEqual(cursor.fetchone()[0], 1)
