@@ -1,15 +1,18 @@
 import json
 from io import BytesIO
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from django.apps import apps
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.test import TestCase
 
 from judge.models import Comment, CommentLock, Language, MiscConfig, Submission, SubmissionTestCase
 from judge.models.tests.util import CommonDataMixin, create_contest, create_contest_participation, \
     create_contest_problem, create_problem
-from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY
+from judge.views.cppro_api import CPPRO_PROBLEM_COMMENT_REACTIONS_KEY, CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, \
+    CPPRO_SUBMISSION_VERIFICATION_SESSION_KEY, _update_cppro_problem_comment_reaction
 
 
 def testcase_zip(**files):
@@ -310,3 +313,16 @@ class CpproManagementApiTestCase(CommonDataMixin, TestCase):
         latest_members = json.loads(latest.value)['comments'][str(comment.id)]
         self.assertEqual(latest_members[str(reactor.profile.id)], 'like')
         self.assertEqual(json.loads(older.value), {'comments': {}})
+
+    def test_problem_comment_reaction_advisory_lock_is_released_after_save_error(self):
+        reactor = self.users['staff_problem_edit_own'].profile
+        with patch(
+            'judge.views.cppro_api._save_cppro_problem_comment_reactions',
+            side_effect=RuntimeError('forced reaction save failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'forced reaction save failure'):
+                _update_cppro_problem_comment_reaction(123, reactor.id, 'like')
+
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT IS_FREE_LOCK(%s)', [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK])
+            self.assertEqual(cursor.fetchone()[0], 1)

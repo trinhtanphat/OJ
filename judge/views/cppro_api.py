@@ -3,6 +3,7 @@ import os
 import re
 import secrets
 import uuid
+from contextlib import contextmanager
 from io import BytesIO
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from urllib.parse import urlsplit
@@ -17,7 +18,7 @@ from django.contrib.sites.shortcuts import get_current_site
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.mail.backends.smtp import EmailBackend
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Avg, Count, F, Max, Min, Prefetch, Q, Sum
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect
@@ -55,6 +56,12 @@ CPPRO_TESTCASE_ARCHIVE_MAX_ENTRY_BYTES = 4 * 1024 * 1024
 CPPRO_TESTCASE_ARCHIVE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 CPPRO_PROBLEM_COMMENT_REACTIONS_KEY = 'cppro_problem_comment_rx'
 CPPRO_PROBLEM_COMMENT_REACTIONS = frozenset({'like', 'love', 'celebrate', 'insightful'})
+CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK = 'cppro_problem_comment_reactions'
+CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK_TIMEOUT_SECONDS = 5
+
+
+class _CpproProblemCommentReactionsBusy(Exception):
+    pass
 
 
 def _cppro_post_registry():
@@ -1337,13 +1344,35 @@ def _save_cppro_problem_comment_reactions(rows, config_row=None):
         config_row.save(update_fields=['value'])
 
 
+@contextmanager
+def _cppro_problem_comment_reaction_lock():
+    acquired = False
+    with connection.cursor() as cursor:
+        cursor.execute(
+            'SELECT GET_LOCK(%s, %s)',
+            [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK, CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK_TIMEOUT_SECONDS],
+        )
+        row = cursor.fetchone()
+        acquired = bool(row and row[0] == 1)
+    if not acquired:
+        raise _CpproProblemCommentReactionsBusy()
+    try:
+        yield
+    finally:
+        # MySQL advisory locks are connection-scoped and do not commit or
+        # interfere with Django TestCase/ATOMIC_REQUESTS transactions.
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT RELEASE_LOCK(%s)', [CPPRO_PROBLEM_COMMENT_REACTIONS_LOCK])
+            cursor.fetchone()
+
+
 def _update_cppro_problem_comment_reaction(comment_id, profile_id, reaction):
-    # MiscConfig.key is indexed but not unique, so a row lock cannot protect
-    # the first concurrent insert. Keep the read-modify-write cycle under the
-    # native DMOJ table lock and consistently update the newest legacy row.
-    with LockModel(write=(MiscConfig,)):
+    # MiscConfig.key is not unique, so serialize first insert and later updates
+    # with a bounded advisory lock, then consistently mutate the newest row.
+    with _cppro_problem_comment_reaction_lock(), transaction.atomic():
         config_row = (
             MiscConfig.objects
+            .select_for_update()
             .filter(key=CPPRO_PROBLEM_COMMENT_REACTIONS_KEY)
             .order_by('-id')
             .first()
@@ -1501,7 +1530,10 @@ def cppro_problem_comments(request, identifier, comment_id=None, action=None):
     reaction = str(payload.get('reaction') or '').strip().lower() or None
     if reaction is not None and reaction not in CPPRO_PROBLEM_COMMENT_REACTIONS:
         return _json_error('Unknown reaction.', 400)
-    reaction_rows = _update_cppro_problem_comment_reaction(comment.id, profile.id, reaction)
+    try:
+        reaction_rows = _update_cppro_problem_comment_reaction(comment.id, profile.id, reaction)
+    except _CpproProblemCommentReactionsBusy:
+        return _json_error('Comment reactions are busy. Please try again.', 503)
     return JsonResponse(
         _cppro_problem_comment_row(comment, profile, reaction_rows),
         json_dumps_params={'ensure_ascii': False},
